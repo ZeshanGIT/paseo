@@ -42,6 +42,7 @@ function getSnapshot(
   cachedLatestReplies: ReadonlyMap<string, string> = new Map(),
   conversationCache: WatchConversationCache | null = null,
   lastTurnDurationByAgentId: ReadonlyMap<string, number> = new Map(),
+  forcedWorkingAgentId: string | null = null,
 ): WatchSnapshot {
   const source = findOnlineSession();
   if (!source) {
@@ -54,7 +55,17 @@ function getSnapshot(
     { isActive: boolean; startedAt: Date | null }
   >();
   for (const agent of source.session.agents.values()) {
-    turnPresentationByAgentId.set(agent.id, selectAgentTurnPresentation(source.session, agent.id));
+    const presentation = selectAgentTurnPresentation(source.session, agent.id);
+    turnPresentationByAgentId.set(
+      agent.id,
+      agent.id === forcedWorkingAgentId
+        ? {
+            ...presentation,
+            isActive: true,
+            startedAt: presentation.startedAt ?? new Date(),
+          }
+        : presentation,
+    );
     const items = [
       ...(source.session.agentStreamTail.get(agent.id) ?? []),
       ...(source.session.agentStreamHead.get(agent.id) ?? []),
@@ -112,6 +123,7 @@ export class WearBridgeCoordinator {
   private stopNative: (() => void) | null = null;
   private stopStore: (() => void) | null = null;
   private publishTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchedRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private replyPollTimer: ReturnType<typeof setTimeout> | null = null;
   private replyPollGeneration = 0;
   private replyPollingActive = false;
@@ -121,7 +133,11 @@ export class WearBridgeCoordinator {
   private latestRepliesByAgentId = new Map<string, string>();
   private lastTurnDurationByAgentId = new Map<string, number>();
   private watchedTurnActive = false;
+  private watchedPresentationActive = false;
   private watchedTurnStartedAt: number | null = null;
+  private lastObservedUserMessageId: string | null = null;
+  private watchedSessionGeneration = 0;
+  private watchedRefreshChain: Promise<void> = Promise.resolve();
 
   start(): void {
     if (this.stopNative) return;
@@ -138,7 +154,10 @@ export class WearBridgeCoordinator {
     this.stopNative = null;
     this.stopStore = null;
     if (this.publishTimer) clearTimeout(this.publishTimer);
+    if (this.watchedRefreshTimer) clearTimeout(this.watchedRefreshTimer);
     this.publishTimer = null;
+    this.watchedRefreshTimer = null;
+    this.watchedSessionGeneration += 1;
     this.cancelReplyPolling();
   }
 
@@ -148,34 +167,18 @@ export class WearBridgeCoordinator {
       source && this.watchedAgentId
         ? selectAgentTurnPresentation(source.session, this.watchedAgentId)
         : null;
-    if (presentation?.isActive && !this.watchedTurnActive && this.watchedAgentId) {
-      this.watchedTurnActive = true;
-      this.watchedTurnStartedAt = presentation.startedAt?.getTime() ?? Date.now();
-      this.lastTurnDurationByAgentId.delete(this.watchedAgentId);
+    if (presentation?.isActive && !this.watchedPresentationActive && this.watchedAgentId) {
+      this.watchedPresentationActive = true;
+      this.beginWatchedTurn(presentation.startedAt?.getTime() ?? Date.now());
       if (this.publishTimer) clearTimeout(this.publishTimer);
       this.publishTimer = null;
       void this.publish().catch((error) =>
         console.warn("[WearBridge] Start publish failed", error),
       );
-    } else if (
-      presentation &&
-      !presentation.isActive &&
-      this.watchedTurnActive &&
-      this.watchedAgentId
-    ) {
-      const completedAgentId = this.watchedAgentId;
-      const startedAt = this.watchedTurnStartedAt;
-      this.watchedTurnActive = false;
-      this.watchedTurnStartedAt = null;
-      if (startedAt != null) {
-        this.lastTurnDurationByAgentId.set(completedAgentId, Math.max(0, Date.now() - startedAt));
-      }
-      if (this.publishTimer) clearTimeout(this.publishTimer);
-      this.publishTimer = null;
-      void this.refreshWatchedConversation()
-        .then(() => this.publish())
-        .catch((error) => console.warn("[WearBridge] Completion publish failed", error));
+    } else if (presentation && !presentation.isActive) {
+      this.watchedPresentationActive = false;
     }
+    this.scheduleWatchedConversationRefresh();
     this.ensureWatchedConversationPolling();
     if (this.publishTimer) clearTimeout(this.publishTimer);
     this.publishTimer = setTimeout(() => {
@@ -193,6 +196,7 @@ export class WearBridgeCoordinator {
           this.latestRepliesByAgentId,
           this.conversationCache,
           this.lastTurnDurationByAgentId,
+          this.watchedTurnActive ? this.watchedAgentId : null,
         ),
       ),
     );
@@ -202,6 +206,7 @@ export class WearBridgeCoordinator {
     client: DaemonClient,
     workspaceId: string,
     agentId: string,
+    isCurrent: () => boolean = () => true,
   ): Promise<string | null> {
     const page = await client.fetchAgentTimeline(agentId, {
       direction: "tail",
@@ -209,6 +214,7 @@ export class WearBridgeCoordinator {
       projection: "projected",
       timeout: 10_000,
     });
+    if (!isCurrent()) return null;
     this.conversationCache = mergeConversationPage({
       current: this.conversationCache,
       workspaceId,
@@ -220,7 +226,53 @@ export class WearBridgeCoordinator {
     return reply;
   }
 
-  private async loadOlderConversation(client: DaemonClient): Promise<void> {
+  private enqueueWatchedRefresh(
+    client: DaemonClient,
+    workspaceId: string,
+    agentId: string,
+  ): Promise<string | null> {
+    const generation = this.watchedSessionGeneration;
+    let result: string | null = null;
+    const task = this.watchedRefreshChain.then(async () => {
+      if (generation !== this.watchedSessionGeneration) return undefined;
+      result = await this.refreshConversation(
+        client,
+        workspaceId,
+        agentId,
+        () =>
+          generation === this.watchedSessionGeneration &&
+          this.watchedWorkspaceId === workspaceId &&
+          this.watchedAgentId === agentId,
+      );
+      return undefined;
+    });
+    this.watchedRefreshChain = task.catch(() => undefined);
+    return task.then(() => result);
+  }
+
+  private enqueueOlderConversation(client: DaemonClient): Promise<void> {
+    const generation = this.watchedSessionGeneration;
+    const workspaceId = this.watchedWorkspaceId;
+    const agentId = this.watchedAgentId;
+    const task = this.watchedRefreshChain.then(async () => {
+      if (generation !== this.watchedSessionGeneration) return undefined;
+      await this.loadOlderConversation(
+        client,
+        () =>
+          generation === this.watchedSessionGeneration &&
+          this.watchedWorkspaceId === workspaceId &&
+          this.watchedAgentId === agentId,
+      );
+      return undefined;
+    });
+    this.watchedRefreshChain = task.catch(() => undefined);
+    return task;
+  }
+
+  private async loadOlderConversation(
+    client: DaemonClient,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const cache = this.conversationCache;
       if (!cache?.hasOlder || !cache.startCursor) return;
@@ -232,6 +284,7 @@ export class WearBridgeCoordinator {
         projection: "projected",
         timeout: 10_000,
       });
+      if (!isCurrent()) return;
       this.conversationCache = mergeConversationPage({
         current: cache,
         workspaceId: cache.workspaceId,
@@ -266,7 +319,8 @@ export class WearBridgeCoordinator {
       this.replyPollTimer = null;
       attempts += 1;
       try {
-        const reply = await this.refreshConversation(client, workspaceId, agentId);
+        const reply = await this.enqueueWatchedRefresh(client, workspaceId, agentId);
+        if (pollGeneration !== this.replyPollGeneration) return;
         await this.publish();
         if (reply && reply !== previousReply) sawNewReply = true;
         const liveSession = findOnlineSession()?.session;
@@ -277,7 +331,9 @@ export class WearBridgeCoordinator {
         const explicitlyFinished = isExplicitlyFinishedAgent(agent);
         if (sawNewReply && !running && reply === lastReply) {
           stableFinishedPolls += 1;
-          if (stableFinishedPolls >= (explicitlyFinished ? 1 : 8)) {
+          if (stableFinishedPolls >= (explicitlyFinished ? 1 : 2)) {
+            this.completeWatchedTurn();
+            await this.publish();
             this.finishReplyPolling(pollGeneration);
             return;
           }
@@ -288,9 +344,12 @@ export class WearBridgeCoordinator {
       } catch (error) {
         console.warn("[WearBridge] Reply refresh failed", error);
       }
+      if (pollGeneration !== this.replyPollGeneration) return;
       if (pollGeneration === this.replyPollGeneration && attempts < 80) {
         this.replyPollTimer = setTimeout(() => void poll(), 1_500);
       } else {
+        this.completeWatchedTurn();
+        await this.publish();
         this.finishReplyPolling(pollGeneration);
       }
     };
@@ -311,6 +370,65 @@ export class WearBridgeCoordinator {
     this.replyPollingActive = false;
   }
 
+  private beginWatchedTurn(startedAt: number): void {
+    if (!this.watchedAgentId) return;
+    this.watchedTurnActive = true;
+    this.watchedTurnStartedAt = startedAt;
+    this.lastTurnDurationByAgentId.delete(this.watchedAgentId);
+  }
+
+  private completeWatchedTurn(): void {
+    if (!this.watchedAgentId || !this.watchedTurnActive) return;
+    const startedAt = this.watchedTurnStartedAt;
+    this.watchedTurnActive = false;
+    this.watchedTurnStartedAt = null;
+    if (startedAt != null) {
+      this.lastTurnDurationByAgentId.set(this.watchedAgentId, Math.max(0, Date.now() - startedAt));
+    }
+  }
+
+  private scheduleWatchedConversationRefresh(): void {
+    if (!this.watchedAgentId || !this.watchedWorkspaceId || this.watchedRefreshTimer) return;
+    this.watchedRefreshTimer = setTimeout(() => {
+      this.watchedRefreshTimer = null;
+      const source = findOnlineSession();
+      const agentId = this.watchedAgentId;
+      const workspaceId = this.watchedWorkspaceId;
+      if (!source || !agentId || !workspaceId) return;
+      const refreshGeneration = this.watchedSessionGeneration;
+      const previousReply = latestAssistantReply(this.conversationCache);
+      void this.enqueueWatchedRefresh(source.client, workspaceId, agentId)
+        .then(() => {
+          if (refreshGeneration !== this.watchedSessionGeneration) return;
+          const latestUser = this.conversationCache?.messages.findLast(
+            (message) => message.role === "user",
+          )?.id;
+          if (latestUser && latestUser !== this.lastObservedUserMessageId) {
+            this.lastObservedUserMessageId = latestUser;
+            this.beginWatchedTurn(Date.now());
+            if (!this.replyPollingActive) {
+              this.startReplyPolling(source.client, workspaceId, agentId, previousReply);
+            }
+          }
+          return this.publish();
+        })
+        .catch((error) => console.warn("[WearBridge] Watched refresh failed", error))
+        .finally(() => {
+          if (
+            refreshGeneration === this.watchedSessionGeneration &&
+            this.watchedWorkspaceId === workspaceId &&
+            this.watchedAgentId === agentId &&
+            !this.watchedRefreshTimer
+          ) {
+            this.watchedRefreshTimer = setTimeout(() => {
+              this.watchedRefreshTimer = null;
+              this.scheduleWatchedConversationRefresh();
+            }, 1_250);
+          }
+        });
+    }, 100);
+  }
+
   private ensureWatchedConversationPolling(): void {
     if (this.replyPollingActive || !this.watchedAgentId || !this.watchedWorkspaceId) return;
     const source = findOnlineSession();
@@ -328,7 +446,7 @@ export class WearBridgeCoordinator {
     if (!this.watchedAgentId || !this.watchedWorkspaceId) return;
     const source = findOnlineSession();
     if (!source) return;
-    await this.refreshConversation(
+    await this.enqueueWatchedRefresh(
       source.client,
       this.watchedWorkspaceId,
       this.watchedAgentId,
@@ -384,6 +502,7 @@ export class WearBridgeCoordinator {
       this.latestRepliesByAgentId,
       this.conversationCache,
       this.lastTurnDurationByAgentId,
+      this.watchedTurnActive ? this.watchedAgentId : null,
     );
     if (command.kind === "GET_SNAPSHOT" || command.kind === "GET_PROJECTS") {
       return { v: 1, id: command.id, ok: true, snapshot };
@@ -431,21 +550,33 @@ export class WearBridgeCoordinator {
     let session = snapshot.sessions.find((item) => item.workspaceId === command.workspaceId);
     if (session?.agentId) {
       this.cancelReplyPolling();
+      if (this.watchedRefreshTimer) clearTimeout(this.watchedRefreshTimer);
+      this.watchedRefreshTimer = null;
+      this.watchedSessionGeneration += 1;
+      this.watchedTurnActive = false;
+      this.watchedPresentationActive = false;
+      this.watchedTurnStartedAt = null;
+      this.lastObservedUserMessageId = null;
       this.watchedAgentId = session.agentId;
       this.watchedWorkspaceId = session.workspaceId;
       const source = findOnlineSession();
       if (source) {
-        await this.refreshConversation(source.client, session.workspaceId, session.agentId).catch(
+        await this.enqueueWatchedRefresh(source.client, session.workspaceId, session.agentId).catch(
           (error) => console.warn("[WearBridge] Conversation refresh failed", error),
         );
+        this.lastObservedUserMessageId =
+          this.conversationCache?.messages.findLast((message) => message.role === "user")?.id ??
+          null;
         snapshot = getSnapshot(
           this.generation,
           this.latestRepliesByAgentId,
           this.conversationCache,
           this.lastTurnDurationByAgentId,
+          this.watchedTurnActive ? this.watchedAgentId : null,
         );
         session = snapshot.sessions.find((item) => item.workspaceId === command.workspaceId);
         this.ensureWatchedConversationPolling();
+        this.scheduleWatchedConversationRefresh();
       }
     }
     return session
@@ -465,7 +596,7 @@ export class WearBridgeCoordinator {
         code: "UNAVAILABLE",
         message: "Conversation history is unavailable",
       });
-    await this.loadOlderConversation(source.client);
+    await this.enqueueOlderConversation(source.client);
     return this.success(
       command.id,
       getSnapshot(
@@ -473,6 +604,7 @@ export class WearBridgeCoordinator {
         this.latestRepliesByAgentId,
         this.conversationCache,
         this.lastTurnDurationByAgentId,
+        this.watchedTurnActive ? this.watchedAgentId : null,
       ),
     );
   }
@@ -498,6 +630,7 @@ export class WearBridgeCoordinator {
         latestAssistantReply(this.conversationCache) ??
         this.latestRepliesByAgentId.get(target.agentId) ??
         null;
+      this.beginWatchedTurn(Date.now());
       await target.source.client.sendAgentMessage(target.agentId, command.text.trim());
       await this.publish();
       if (this.watchedWorkspaceId) {
@@ -515,6 +648,7 @@ export class WearBridgeCoordinator {
           this.latestRepliesByAgentId,
           this.conversationCache,
           this.lastTurnDurationByAgentId,
+          this.watchedTurnActive ? this.watchedAgentId : null,
         ),
       );
     } catch {

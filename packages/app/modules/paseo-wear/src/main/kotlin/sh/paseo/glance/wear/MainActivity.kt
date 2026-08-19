@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,6 +46,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -61,7 +63,6 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
@@ -310,9 +311,9 @@ private fun ConversationScreen(
   var awaitingFirstAssistantFragment by remember(destination.workspaceId, viewMode) { mutableStateOf(false) }
   var assistantSequenceAtSend by remember(destination.workspaceId, viewMode) { mutableStateOf<Long?>(null) }
   var positionedGlanceIds by remember(destination.workspaceId) { mutableStateOf(emptySet<String>()) }
+  var glanceFocusSeeded by remember(destination.workspaceId) { mutableStateOf(false) }
   val focusRequester = remember { FocusRequester() }
   val listState = rememberLazyListState()
-  val density = LocalDensity.current
 
   BackHandler(composing) { composing = false }
   LaunchedEffect(composing) {
@@ -374,25 +375,88 @@ private fun ConversationScreen(
       }
     }
   }
-  val newestGlanceFocus = glanceMessages.lastOrNull {
-    it.role == WatchMessageRole.ASSISTANT && (":status:" in it.id || ":summary:" in it.id)
+  val latestUserSequenceForFocus = messages.lastOrNull {
+    it.role == WatchMessageRole.USER
+  }?.sequence ?: Long.MIN_VALUE
+  val glanceFocusCandidates = glanceMessages.filter {
+    it.role == WatchMessageRole.ASSISTANT &&
+      it.sequence > latestUserSequenceForFocus &&
+      (":status:" in it.id || ":summary:" in it.id)
+  }.map { message ->
+    val token = if (
+      ":summary:" in message.id &&
+        session?.lastTurnDurationMs != null &&
+        session.state != WatchState.WORKING
+    ) {
+      "${message.id}:completed"
+    } else {
+      message.id
+    }
+    message to token
   }
-  LaunchedEffect(viewMode, newestGlanceFocus?.id, positionedAtNewest) {
+  val newestGlanceFocus = glanceFocusCandidates.lastOrNull()?.first
+  LaunchedEffect(viewMode, positionedAtNewest, glanceFocusSeeded) {
+    if (viewMode == WatchViewMode.GLANCE && positionedAtNewest && !glanceFocusSeeded) {
+      positionedGlanceIds = positionedGlanceIds + glanceFocusCandidates.map { it.second }
+      glanceFocusSeeded = true
+    }
+  }
+  val pendingGlanceFocus = if (glanceFocusSeeded) {
+    glanceFocusCandidates.firstOrNull { (_, token) -> token !in positionedGlanceIds }
+  } else {
+    null
+  }
+  LaunchedEffect(viewMode, pendingGlanceFocus?.second, positionedAtNewest) {
+    val (focusMessage, focusToken) = pendingGlanceFocus ?: return@LaunchedEffect
     if (
       viewMode == WatchViewMode.GLANCE &&
-        positionedAtNewest &&
-        newestGlanceFocus != null &&
-        newestGlanceFocus.id !in positionedGlanceIds
+        positionedAtNewest
     ) {
       val statusRow = timelineRows.indexOfFirst {
-        it is ConversationRow.Message && it.value.id == newestGlanceFocus.id
+        it is ConversationRow.Message && it.value.id == focusMessage.id
       }
       if (statusRow >= 0) {
-        positionedGlanceIds = positionedGlanceIds + newestGlanceFocus.id
-        val centerOffset = with(density) {
-          if (":summary:" in newestGlanceFocus.id) -54.dp.roundToPx() else -110.dp.roundToPx()
+        val precedingStatusRow = if (":summary:" in focusMessage.id) {
+          val sourcePrefix = focusMessage.id.substringBefore(":summary:")
+          timelineRows.subList(0, statusRow).indexOfLast {
+            it is ConversationRow.Message &&
+              it.sequence > latestUserSequenceForFocus &&
+              it.value.id.startsWith("$sourcePrefix:status:")
+          }
+        } else {
+          -1
         }
-        listState.scrollToItem(statusRow + 2, centerOffset)
+        val groupStartRow = precedingStatusRow.takeIf { it >= 0 } ?: statusRow
+        listState.scrollToItem(groupStartRow + 2)
+        withFrameNanos { }
+        withFrameNanos { }
+        val layout = listState.layoutInfo
+        val focusedItem = layout.visibleItemsInfo.firstOrNull {
+          it.key == "message:${focusMessage.id}"
+        }
+        if (focusedItem != null) {
+          val precedingItem = if (precedingStatusRow >= 0) {
+            val precedingRow = timelineRows[precedingStatusRow] as ConversationRow.Message
+            layout.visibleItemsInfo.firstOrNull { it.key == precedingRow.key }
+          } else {
+            null
+          }
+          val groupStart = minOf(focusedItem.offset, precedingItem?.offset ?: focusedItem.offset)
+          val groupEnd = maxOf(
+            focusedItem.offset + focusedItem.size,
+            precedingItem?.let { it.offset + it.size } ?: focusedItem.offset + focusedItem.size,
+          )
+          val groupSize = groupEnd - groupStart
+          val viewportSize = layout.viewportEndOffset - layout.viewportStartOffset
+          val desiredOffset = if (groupSize < viewportSize) {
+            layout.viewportStartOffset + (viewportSize - groupSize) / 2
+          } else {
+            layout.viewportStartOffset
+          }
+          listState.scrollBy((groupStart - desiredOffset).toFloat())
+        }
+        delay(1_000)
+        positionedGlanceIds = positionedGlanceIds + focusToken
       }
     }
   }
@@ -455,11 +519,12 @@ private fun ConversationScreen(
     }
     items(timelineRows, key = ConversationRow::key) { row ->
       when (row) {
-        is ConversationRow.Message -> Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement =
-            if (row.value.role == WatchMessageRole.USER) Arrangement.End else Arrangement.Start,
-        ) {
+        is ConversationRow.Message -> Column(modifier = Modifier.fillMaxWidth()) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement =
+              if (row.value.role == WatchMessageRole.USER) Arrangement.End else Arrangement.Start,
+          ) {
           val latestUserSequence = messages.lastOrNull {
             it.role == WatchMessageRole.USER
           }?.sequence ?: Long.MIN_VALUE
@@ -474,19 +539,27 @@ private fun ConversationScreen(
                 (":summary:" in it.id || ":reply" in it.id)
             }?.id
           }
-          ConversationMessage(
-            message = row.value,
-            metadata = if (
-              row.value.role == WatchMessageRole.ASSISTANT &&
-                row.value.id == metadataTargetId &&
-                session?.state != WatchState.WORKING &&
-                (
-                  session?.lastTurnDurationMs != null ||
-                    session?.state == WatchState.COMPLETE ||
-                    session?.state == WatchState.FAILED
-                )
-            ) completedTurnMetadata(messages, row.value, session) else null,
-          )
+            ConversationMessage(
+              message = row.value,
+              metadata = if (
+                row.value.role == WatchMessageRole.ASSISTANT &&
+                  row.value.id == metadataTargetId &&
+                  session?.state != WatchState.WORKING &&
+                  (
+                    session?.lastTurnDurationMs != null ||
+                      session?.state == WatchState.COMPLETE ||
+                      session?.state == WatchState.FAILED
+                  )
+              ) completedTurnMetadata(messages, row.value, session) else null,
+            )
+          }
+          if (
+            viewMode == WatchViewMode.GLANCE &&
+              row.value.id == newestGlanceFocus?.id &&
+              session?.state == WatchState.WORKING
+          ) {
+            GlanceWorkingMetadata(session)
+          }
         }
         is ConversationRow.Activity -> ActivityTimelineRow(row.value)
       }
@@ -581,6 +654,39 @@ private fun ConversationScreen(
         }
       }
     }
+  }
+}
+
+@Composable
+private fun GlanceWorkingMetadata(session: WatchSession) {
+  var now by remember(session.activeTurnStartedAt) { mutableStateOf(System.currentTimeMillis()) }
+  LaunchedEffect(session.activeTurnStartedAt) {
+    while (true) {
+      now = System.currentTimeMillis()
+      delay(1_000)
+    }
+  }
+  val elapsed = session.activeTurnStartedAt?.let { (now - it).coerceAtLeast(0L) }
+  Row(
+    modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 5.dp),
+    horizontalArrangement = Arrangement.spacedBy(6.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    CircularProgressIndicator(
+      modifier = Modifier.size(10.dp),
+      color = PaseoPalette.StatusRunning,
+      strokeWidth = 1.5.dp,
+    )
+    Text(
+      buildList {
+        add("Working${elapsed?.let { " for ${formatDuration(it)}" } ?: ""}")
+        friendlyModel(session.model)?.let(::add)
+        friendlyLabel(session.effort)?.let(::add)
+      }.joinToString(" · "),
+      color = PaseoPalette.ForegroundMuted,
+      fontSize = 10.sp,
+      lineHeight = 12.sp,
+    )
   }
 }
 
