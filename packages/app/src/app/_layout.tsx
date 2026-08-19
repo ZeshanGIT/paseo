@@ -132,6 +132,7 @@ import {
 import { buildNotificationRoute, resolveNotificationTarget } from "@/utils/notification-routing";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { PluginCatalogSync } from "@/plugins";
+import { startWearBridge } from "@/wear/coordinator";
 import {
   ensureOsNotificationPermission,
   WEB_NOTIFICATION_CLICK_EVENT,
@@ -316,6 +317,11 @@ function HostSessionManager() {
       ))}
     </>
   );
+}
+
+function WearBridgeBootstrap() {
+  useEffect(() => startWearBridge(), []);
+  return null;
 }
 
 export function useEarliestOnlineHostServerId(): string | null {
@@ -704,6 +710,7 @@ function ProvidersWrapper({ children }: { children: ReactNode }) {
       <DesktopWindowControlsSync enabled={!settingsLoading} />
       <OfferLinkListener upsertDaemonFromOfferUrl={upsertConnectionFromOfferUrl} />
       <HostSessionManager />
+      <WearBridgeBootstrap />
       <FaviconStatusSync />
       <AppearanceStyleBoundary>{children}</AppearanceStyleBoundary>
     </VoiceProvider>

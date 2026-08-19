@@ -75,6 +75,7 @@ import { HighlightedCodeBlock } from "@/components/highlighted-code-block";
 import { MarkdownFenceBlock } from "@/components/markdown/fence";
 import type { MarkdownPhase } from "@/components/markdown/fence/types";
 import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
+import { parseWatchControlSegments } from "@/watch-control-blocks";
 import { colorMarkdownLinkChildren } from "@/components/markdown/link-children";
 import { createAssistantMarkdownParser } from "@/utils/assistant-markdown-parser";
 import { formatDuration, formatMessageTimestamp } from "@/utils/time";
@@ -755,6 +756,41 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   containerCompactBottom: {
     paddingBottom: 0,
   },
+  watchStatusChip: {
+    alignSelf: "flex-start",
+    maxWidth: "100%",
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    paddingHorizontal: theme.spacing[3],
+    paddingVertical: theme.spacing[2],
+    borderRadius: theme.borderRadius.full,
+    borderWidth: 1,
+    borderColor: theme.colors.borderAccent,
+    backgroundColor: theme.colors.surface2,
+  },
+  watchStatusLabel: {
+    color: theme.colors.accentBright,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.semibold,
+  },
+  watchStatusText: {
+    flexShrink: 1,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  watchSummary: {
+    borderLeftWidth: 2,
+    borderLeftColor: theme.colors.accent,
+    paddingLeft: theme.spacing[4],
+  },
+  watchSummaryLabel: {
+    color: theme.colors.accentBright,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.semibold,
+    marginBottom: theme.spacing[2],
+  },
   imageFrame: {
     width: "100%",
     minHeight: 160,
@@ -1349,6 +1385,16 @@ interface MemoizedMarkdownBlockProps {
   onLinkPress: (url: string) => boolean;
 }
 
+function withOccurrenceKeys<T>(values: readonly T[], identity: (value: T) => string) {
+  const occurrences = new Map<string, number>();
+  return values.map((value) => {
+    const base = identity(value);
+    const occurrence = occurrences.get(base) ?? 0;
+    occurrences.set(base, occurrence + 1);
+    return { key: `${base}:${occurrence}`, value };
+  });
+}
+
 const MemoizedMarkdownBlock = React.memo(function MemoizedMarkdownBlock({
   text,
   rules,
@@ -1894,10 +1940,14 @@ export const AssistantMessage = memo(function AssistantMessage({
     };
   }, [client, fileLinkActions, markdownParser, occurrenceKey, phase, serverId, workspaceRoot]);
 
-  const blocks = useMemo(() => splitMarkdownBlocks(message), [message]);
-  const keyedBlocks = useMemo(
-    () => blocks.map((block, index) => ({ key: `block:${index}`, block })),
-    [blocks],
+  const presentationSegments = useMemo(() => parseWatchControlSegments(message), [message]);
+  const keyedPresentationSegments = useMemo(
+    () =>
+      withOccurrenceKeys(
+        presentationSegments,
+        (segment) => `${segment.kind}:${segment.text.slice(0, 80)}`,
+      ),
+    [presentationSegments],
   );
 
   const assistantContainerStyle = useMemo(
@@ -1913,20 +1963,68 @@ export const AssistantMessage = memo(function AssistantMessage({
 
   return (
     <View testID="assistant-message" style={assistantContainerStyle}>
-      {keyedBlocks.map(({ key, block }, index) => (
-        <AssistantMessageBlockContainer
-          key={key}
-          block={block}
-          marginBottom={index < keyedBlocks.length - 1 ? 12 : 0}
-        >
-          <MemoizedMarkdownBlock
-            text={block}
-            rules={markdownRules}
-            parser={markdownParser}
-            onLinkPress={handleMarkdownLinkPress}
-          />
-        </AssistantMessageBlockContainer>
-      ))}
+      {keyedPresentationSegments.map(({ key: segmentKey, value: segment }, segmentIndex) => {
+        const segmentMarginBottom = segmentIndex < keyedPresentationSegments.length - 1 ? 12 : 0;
+        if (segment.kind === "status") {
+          return (
+            <View
+              key={segmentKey}
+              style={[
+                assistantMessageStylesheet.watchStatusChip,
+                segmentMarginBottom > 0 ? { marginBottom: segmentMarginBottom } : undefined,
+              ]}
+            >
+              <Text style={assistantMessageStylesheet.watchStatusLabel}>Glance</Text>
+              <Text style={assistantMessageStylesheet.watchStatusText}>{segment.text}</Text>
+            </View>
+          );
+        }
+
+        const blocks = splitMarkdownBlocks(segment.text).filter((block) => block.trim().length > 0);
+        const keyedBlocks = withOccurrenceKeys(blocks, (block) => block.slice(0, 80));
+        if (segment.kind === "summary") {
+          return (
+            <View
+              key={segmentKey}
+              style={[
+                assistantMessageStylesheet.watchSummary,
+                segmentMarginBottom > 0 ? { marginBottom: segmentMarginBottom } : undefined,
+              ]}
+            >
+              <Text style={assistantMessageStylesheet.watchSummaryLabel}>Glance summary</Text>
+              {keyedBlocks.map(({ key, value: block }, index) => (
+                <AssistantMessageBlockContainer
+                  key={key}
+                  block={block}
+                  marginBottom={index < blocks.length - 1 ? 12 : 0}
+                >
+                  <MemoizedMarkdownBlock
+                    text={block}
+                    rules={markdownRules}
+                    parser={markdownParser}
+                    onLinkPress={handleMarkdownLinkPress}
+                  />
+                </AssistantMessageBlockContainer>
+              ))}
+            </View>
+          );
+        }
+
+        return keyedBlocks.map(({ key, value: block }, index) => (
+          <AssistantMessageBlockContainer
+            key={key}
+            block={block}
+            marginBottom={index < blocks.length - 1 ? 12 : segmentMarginBottom}
+          >
+            <MemoizedMarkdownBlock
+              text={block}
+              rules={markdownRules}
+              parser={markdownParser}
+              onLinkPress={handleMarkdownLinkPress}
+            />
+          </AssistantMessageBlockContainer>
+        ));
+      })}
     </View>
   );
 });
