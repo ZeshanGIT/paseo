@@ -49,6 +49,7 @@ export interface WatchSession {
   pinnedAt?: number;
   latestReply?: string;
   activeTurnStartedAt?: number;
+  lastTurnDurationMs?: number;
   model?: string;
   effort?: string;
   currentActivity?: WatchActivity;

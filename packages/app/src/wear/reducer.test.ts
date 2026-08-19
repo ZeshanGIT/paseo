@@ -2,6 +2,47 @@ import { describe, expect, it } from "vitest";
 import { createWatchSnapshot } from "./reducer";
 
 describe("createWatchSnapshot", () => {
+  it("uses authoritative turn liveness even when the directory agent is idle", () => {
+    const agent = {
+      id: "agent-1",
+      status: "idle" as const,
+      updatedAt: new Date("2026-01-01T00:01:00Z"),
+      pendingPermissions: [],
+      title: "Hello",
+      workspaceId: "workspace-1",
+    };
+    const snapshot = createWatchSnapshot({
+      generation: 1,
+      phoneAvailable: true,
+      workspaces: [
+        {
+          id: "workspace-1",
+          projectId: "project-1",
+          projectDisplayName: "Paseo",
+          title: "General assistance",
+          name: "main",
+          statusEnteredAt: null,
+        },
+      ],
+      agents: [agent],
+      turnPresentationByAgentId: new Map([
+        [
+          agent.id,
+          {
+            isActive: true,
+            startedAt: new Date("2026-01-01T00:00:30Z"),
+          },
+        ],
+      ]),
+    });
+
+    expect(snapshot.sessions[0]).toMatchObject({
+      state: "working",
+      shortStatus: "Working",
+      activeTurnStartedAt: 1767225630000,
+    });
+  });
+
   it("reduces a running agent into a compact working session", () => {
     const currentActivity = {
       id: "tool-1",

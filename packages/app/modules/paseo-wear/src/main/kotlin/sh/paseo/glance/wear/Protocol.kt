@@ -195,6 +195,7 @@ data class WatchSession(
   val pinnedAt: Long?,
   val latestReply: String?,
   val activeTurnStartedAt: Long? = null,
+  val lastTurnDurationMs: Long? = null,
   val model: String? = null,
   val effort: String? = null,
   val currentActivity: WatchActivity? = null,

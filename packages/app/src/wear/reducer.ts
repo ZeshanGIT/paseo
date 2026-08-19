@@ -39,20 +39,23 @@ export interface WearSnapshotInput {
   agents: Iterable<WearAgent>;
   latestRepliesByAgentId?: ReadonlyMap<string, string>;
   currentActivityByAgentId?: ReadonlyMap<string, WatchSession["currentActivity"]>;
+  turnPresentationByAgentId?: ReadonlyMap<string, { isActive: boolean; startedAt: Date | null }>;
+  lastTurnDurationByAgentId?: ReadonlyMap<string, number>;
 }
 
-function toWatchState(agent: WearAgent | null): WatchSession["state"] {
+function toWatchState(agent: WearAgent | null, turnActive = false): WatchSession["state"] {
   if (!agent) return "idle";
   if (agent.requiresAttention)
     return agent.attentionReason === "finished" ? "complete" : "needs_attention";
   if (agent.pendingPermissions.length > 0) return "waiting_for_input";
   if (agent.status === "error") return "failed";
-  if (agent.status === "running") return "working";
+  if (turnActive || agent.status === "running") return "working";
   return "idle";
 }
 
-function toShortStatus(agent: WearAgent | null): string {
+function toShortStatus(agent: WearAgent | null, turnActive = false): string {
   if (!agent) return "Ready";
+  if (turnActive) return "Working";
   if (agent.requiresAttention && agent.attentionReason === "finished") return "Complete";
   if (agent.requiresAttention) return "Needs your input";
   if (agent.pendingPermissions.length > 0) return "Waiting for approval";
@@ -77,19 +80,22 @@ export function createWatchSnapshot(input: WearSnapshotInput): WatchSnapshot {
       label: workspace.projectCustomName ?? workspace.projectDisplayName,
     });
     const agent = agentsByWorkspace.get(workspace.id) ?? null;
+    const turnPresentation = agent ? input.turnPresentationByAgentId?.get(agent.id) : undefined;
+    const activeTurnStartedAt = turnPresentation?.startedAt ?? agent?.activeTurn?.startedAt;
     const latestReply = agent ? input.latestRepliesByAgentId?.get(agent.id)?.trim() : undefined;
     sessions.push({
       workspaceId: workspace.id,
       projectId: workspace.projectId,
       ...(agent ? { agentId: agent.id } : {}),
       label: workspace.title ?? agent?.title ?? workspace.name,
-      state: toWatchState(agent),
-      shortStatus: toShortStatus(agent),
+      state: toWatchState(agent, turnPresentation?.isActive),
+      shortStatus: toShortStatus(agent, turnPresentation?.isActive),
       updatedAt: (agent?.updatedAt ?? workspace.statusEnteredAt ?? new Date(0)).getTime(),
       ...(workspace.pinnedAt ? { pinnedAt: new Date(workspace.pinnedAt).getTime() } : {}),
       ...(latestReply ? { latestReply: latestReply.slice(-1_200) } : {}),
-      ...(agent?.activeTurn?.startedAt
-        ? { activeTurnStartedAt: agent.activeTurn.startedAt.getTime() }
+      ...(activeTurnStartedAt ? { activeTurnStartedAt: activeTurnStartedAt.getTime() } : {}),
+      ...(agent && input.lastTurnDurationByAgentId?.has(agent.id)
+        ? { lastTurnDurationMs: input.lastTurnDurationByAgentId.get(agent.id) }
         : {}),
       ...((agent?.runtimeInfo?.model ?? agent?.model)
         ? { model: (agent?.runtimeInfo?.model ?? agent?.model) as string }

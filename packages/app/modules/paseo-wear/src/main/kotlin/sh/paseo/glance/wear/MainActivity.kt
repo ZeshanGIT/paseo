@@ -295,7 +295,6 @@ private fun ConversationScreen(
     (messages.map(ConversationRow::Message) + activities.map(ConversationRow::Activity))
       .sortedWith(compareBy<ConversationRow> { it.sequence }.thenBy { it.key })
   }
-  val lastAssistant = messages.lastOrNull { it.role == WatchMessageRole.ASSISTANT }
   val glanceMessages = remember(messages) { projectGlanceMessages(messages) }
   val timelineRows = if (viewMode == WatchViewMode.FULL) {
     fullRows
@@ -310,7 +309,7 @@ private fun ConversationScreen(
   var lastOlderRequestBoundary by remember(destination.workspaceId, viewMode) { mutableStateOf<String?>(null) }
   var awaitingFirstAssistantFragment by remember(destination.workspaceId, viewMode) { mutableStateOf(false) }
   var assistantSequenceAtSend by remember(destination.workspaceId, viewMode) { mutableStateOf<Long?>(null) }
-  var lastCenteredGlanceStatusId by remember(destination.workspaceId) { mutableStateOf<String?>(null) }
+  var positionedGlanceIds by remember(destination.workspaceId) { mutableStateOf(emptySet<String>()) }
   val focusRequester = remember { FocusRequester() }
   val listState = rememberLazyListState()
   val density = LocalDensity.current
@@ -375,24 +374,25 @@ private fun ConversationScreen(
       }
     }
   }
-  val newestGlanceStatusId = glanceMessages.lastOrNull {
-    ":status:" in it.id
-  }?.id
-  LaunchedEffect(viewMode, session?.state, newestGlanceStatusId, positionedAtNewest) {
+  val newestGlanceFocus = glanceMessages.lastOrNull {
+    it.role == WatchMessageRole.ASSISTANT && (":status:" in it.id || ":summary:" in it.id)
+  }
+  LaunchedEffect(viewMode, newestGlanceFocus?.id, positionedAtNewest) {
     if (
       viewMode == WatchViewMode.GLANCE &&
-        session?.state == WatchState.WORKING &&
         positionedAtNewest &&
-        newestGlanceStatusId != null &&
-        newestGlanceStatusId != lastCenteredGlanceStatusId
+        newestGlanceFocus != null &&
+        newestGlanceFocus.id !in positionedGlanceIds
     ) {
       val statusRow = timelineRows.indexOfFirst {
-        it is ConversationRow.Message && it.value.id == newestGlanceStatusId
+        it is ConversationRow.Message && it.value.id == newestGlanceFocus.id
       }
       if (statusRow >= 0) {
-        val centerOffset = with(density) { -110.dp.roundToPx() }
+        positionedGlanceIds = positionedGlanceIds + newestGlanceFocus.id
+        val centerOffset = with(density) {
+          if (":summary:" in newestGlanceFocus.id) -54.dp.roundToPx() else -110.dp.roundToPx()
+        }
         listState.scrollToItem(statusRow + 2, centerOffset)
-        lastCenteredGlanceStatusId = newestGlanceStatusId
       }
     }
   }
@@ -460,17 +460,32 @@ private fun ConversationScreen(
           horizontalArrangement =
             if (row.value.role == WatchMessageRole.USER) Arrangement.End else Arrangement.Start,
         ) {
+          val latestUserSequence = messages.lastOrNull {
+            it.role == WatchMessageRole.USER
+          }?.sequence ?: Long.MIN_VALUE
+          val metadataTargetId = if (viewMode == WatchViewMode.FULL) {
+            messages.lastOrNull {
+              it.role == WatchMessageRole.ASSISTANT && it.sequence > latestUserSequence
+            }?.id
+          } else {
+            glanceMessages.lastOrNull {
+              it.role == WatchMessageRole.ASSISTANT &&
+                it.sequence > latestUserSequence &&
+                (":summary:" in it.id || ":reply" in it.id)
+            }?.id
+          }
           ConversationMessage(
             message = row.value,
             metadata = if (
               row.value.role == WatchMessageRole.ASSISTANT &&
-                lastAssistant != null &&
+                row.value.id == metadataTargetId &&
+                session?.state != WatchState.WORKING &&
                 (
-                  row.value.id == lastAssistant.id ||
-                    row.value.id.startsWith("glance:${lastAssistant.id}:")
-                ) &&
-                session?.state != WatchState.WORKING
-            ) completedTurnMetadata(messages, lastAssistant, session) else null,
+                  session?.lastTurnDurationMs != null ||
+                    session?.state == WatchState.COMPLETE ||
+                    session?.state == WatchState.FAILED
+                )
+            ) completedTurnMetadata(messages, row.value, session) else null,
           )
         }
         is ConversationRow.Activity -> ActivityTimelineRow(row.value)
@@ -778,7 +793,8 @@ private fun completedTurnMetadata(
   val user = messages.lastOrNull {
     it.role == WatchMessageRole.USER && it.sequence < assistant.sequence
   }
-  val duration = user?.let { (assistant.timestamp - it.timestamp).coerceAtLeast(0L) }
+  val duration = session?.lastTurnDurationMs
+    ?: user?.let { (assistant.timestamp - it.timestamp).coerceAtLeast(0L) }
   val parts = buildList {
     if (duration != null) add("Worked for ${formatDuration(duration)}")
     friendlyModel(session?.model)?.let(::add)
