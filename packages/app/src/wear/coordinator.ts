@@ -19,8 +19,16 @@ import {
   type WatchActivity,
   type WatchResponse,
   type WatchSnapshot,
+  type WatchVoiceState,
 } from "./protocol";
 import { createWatchSnapshot } from "./reducer";
+import { WatchCommandDeliveryGuard } from "./command-delivery-guard";
+import {
+  createUnavailablePhoneLocalTranscriptionProvider,
+  type TranscriptionProvider,
+} from "./transcription-provider";
+import { navigateToHostWorkspaceRoute } from "@/navigation/workspace-route-navigation";
+import { buildHostAgentDetailRoute, buildHostRootRoute } from "@/utils/host-routes";
 
 interface WearSessionSource {
   session: SessionState;
@@ -138,6 +146,15 @@ export class WearBridgeCoordinator {
   private lastObservedUserMessageId: string | null = null;
   private watchedSessionGeneration = 0;
   private watchedRefreshChain: Promise<void> = Promise.resolve();
+  private voice: WatchVoiceState | null = null;
+  private readonly transcriptionProvider: TranscriptionProvider;
+  private readonly commandDeliveryGuard = new WatchCommandDeliveryGuard();
+
+  constructor(
+    transcriptionProvider: TranscriptionProvider = createUnavailablePhoneLocalTranscriptionProvider(),
+  ) {
+    this.transcriptionProvider = transcriptionProvider;
+  }
 
   start(): void {
     if (this.stopNative) return;
@@ -191,12 +208,14 @@ export class WearBridgeCoordinator {
     this.generation += 1;
     await nativeWearBridge.publishSnapshot(
       JSON.stringify(
-        getSnapshot(
-          this.generation,
-          this.latestRepliesByAgentId,
-          this.conversationCache,
-          this.lastTurnDurationByAgentId,
-          this.watchedTurnActive ? this.watchedAgentId : null,
+        this.withVoice(
+          getSnapshot(
+            this.generation,
+            this.latestRepliesByAgentId,
+            this.conversationCache,
+            this.lastTurnDurationByAgentId,
+            this.watchedTurnActive ? this.watchedAgentId : null,
+          ),
         ),
       ),
     );
@@ -454,6 +473,7 @@ export class WearBridgeCoordinator {
   }
 
   private async handleNativeCommand(event: NativeWatchCommandEvent): Promise<void> {
+    if (!this.commandDeliveryGuard.accept(event.deliveryId)) return;
     let value: unknown;
     try {
       value = JSON.parse(event.command);
@@ -484,7 +504,7 @@ export class WearBridgeCoordinator {
       );
       return;
     }
-    const response = await this.dispatch(command).catch((error) => {
+    const response = await this.dispatch(command, event.nodeId).catch((error) => {
       console.warn("[WearBridge] Command failed", { kind: command.kind, error });
       return createWatchErrorResponse({
         id: command.id,
@@ -495,14 +515,16 @@ export class WearBridgeCoordinator {
     await nativeWearBridge.sendResponse(event.nodeId, JSON.stringify(response));
   }
 
-  private async dispatch(command: WatchCommand): Promise<WatchResponse> {
+  private async dispatch(command: WatchCommand, nodeId: string): Promise<WatchResponse> {
     if (command.kind === "GET_SNAPSHOT") await this.refreshWatchedConversation();
-    const snapshot = getSnapshot(
-      this.generation,
-      this.latestRepliesByAgentId,
-      this.conversationCache,
-      this.lastTurnDurationByAgentId,
-      this.watchedTurnActive ? this.watchedAgentId : null,
+    const snapshot = this.withVoice(
+      getSnapshot(
+        this.generation,
+        this.latestRepliesByAgentId,
+        this.conversationCache,
+        this.lastTurnDurationByAgentId,
+        this.watchedTurnActive ? this.watchedAgentId : null,
+      ),
     );
     if (command.kind === "GET_SNAPSHOT" || command.kind === "GET_PROJECTS") {
       return { v: 1, id: command.id, ok: true, snapshot };
@@ -533,7 +555,151 @@ export class WearBridgeCoordinator {
         message: "Create session is not available in this build",
       });
     }
+    if (command.kind === "START_VOICE_INPUT") return this.startVoiceInput(command, nodeId);
+    if (command.kind === "STOP_VOICE_INPUT") return this.stopVoiceInput(command);
+    if (command.kind === "CANCEL_VOICE_INPUT") return this.cancelVoiceInput(command);
+    if (command.kind === "SEND_TRANSCRIPT") return this.sendTranscript(command);
+    if (command.kind === "OPEN_ON_PHONE") return this.openOnPhone(command);
     return this.sendPrompt(command);
+  }
+
+  private withVoice(snapshot: WatchSnapshot): WatchSnapshot {
+    return this.voice ? { ...snapshot, voice: this.voice } : snapshot;
+  }
+
+  private async setVoice(voice: WatchVoiceState | null): Promise<void> {
+    this.voice = voice;
+    await this.publish();
+  }
+
+  private async startVoiceInput(command: WatchCommand, nodeId: string): Promise<WatchResponse> {
+    if (!command.voiceId || command.format !== "pcm_s16le_16000_mono") {
+      return createWatchErrorResponse({
+        id: command.id,
+        code: "BAD_REQUEST",
+        message: "Invalid voice request",
+      });
+    }
+    if (!findWorkspace(command)) {
+      return createWatchErrorResponse({
+        id: command.id,
+        code: "NOT_FOUND",
+        message: "Agent session not found",
+      });
+    }
+    if (this.voice) await this.cancelVoiceInput({ ...command, kind: "CANCEL_VOICE_INPUT" });
+    try {
+      await nativeWearBridge.registerVoiceTransfer(nodeId, command.voiceId);
+      await this.setVoice({ voiceId: command.voiceId, phase: "recording" });
+      return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+    } catch {
+      await this.setVoice({
+        voiceId: command.voiceId,
+        phase: "error",
+        errorCode: "PHONE_UNAVAILABLE",
+        errorMessage: "Phone voice transfer is unavailable",
+      });
+      return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+    }
+  }
+
+  private async stopVoiceInput(command: WatchCommand): Promise<WatchResponse> {
+    if (
+      !command.voiceId ||
+      !command.sha256 ||
+      command.byteLength === undefined ||
+      this.voice?.voiceId !== command.voiceId
+    ) {
+      return createWatchErrorResponse({
+        id: command.id,
+        code: "BAD_REQUEST",
+        message: "Unknown voice recording",
+      });
+    }
+    try {
+      await this.setVoice({ voiceId: command.voiceId, phase: "uploading" });
+      await nativeWearBridge.finishVoiceTransfer(
+        command.voiceId,
+        command.byteLength,
+        command.sha256,
+      );
+      await this.setVoice({ voiceId: command.voiceId, phase: "transcribing" });
+      const transcript = (
+        await this.transcriptionProvider.transcribe({ voiceId: command.voiceId })
+      ).trim();
+      await this.setVoice(
+        transcript
+          ? { voiceId: command.voiceId, phase: "confirmation", transcript }
+          : {
+              voiceId: command.voiceId,
+              phase: "error",
+              errorCode: "TRANSCRIPT_EMPTY",
+              errorMessage: "No speech detected",
+            },
+      );
+    } catch {
+      await this.setVoice({
+        voiceId: command.voiceId,
+        phase: "error",
+        errorCode: "TRANSCRIPTION_FAILED",
+        errorMessage: "Couldn’t transcribe on this phone",
+      });
+    } finally {
+      // V1 never retains raw Watch audio after the one transcription attempt.
+      await nativeWearBridge.cancelVoiceTransfer(command.voiceId).catch(() => undefined);
+    }
+    return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+  }
+
+  private async cancelVoiceInput(command: WatchCommand): Promise<WatchResponse> {
+    if (command.voiceId) {
+      await Promise.allSettled([
+        nativeWearBridge.cancelVoiceTransfer(command.voiceId),
+        this.transcriptionProvider.cancel(command.voiceId),
+      ]);
+    }
+    if (!command.voiceId || this.voice?.voiceId === command.voiceId) await this.setVoice(null);
+    return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+  }
+
+  private async sendTranscript(command: WatchCommand): Promise<WatchResponse> {
+    if (
+      !command.voiceId ||
+      !command.text?.trim() ||
+      this.voice?.voiceId !== command.voiceId ||
+      this.voice.phase !== "confirmation"
+    ) {
+      return createWatchErrorResponse({
+        id: command.id,
+        code: "BAD_REQUEST",
+        message: "A confirmed transcript is required",
+      });
+    }
+    const response = await this.sendPrompt({ ...command, kind: "SEND_PROMPT" });
+    if (response.ok) await this.setVoice(null);
+    return response;
+  }
+
+  private async openOnPhone(command: WatchCommand): Promise<WatchResponse> {
+    const target = command.workspaceId ? findWorkspace(command) : null;
+    const source = target?.source ?? findOnlineSession();
+    const agent = target?.source.session.agents.get(target.agentId);
+    let route = "/";
+    if (source) route = buildHostRootRoute(source.session.serverId);
+    if (source && target && agent?.serverId) {
+      route = buildHostAgentDetailRoute(agent.serverId, target.agentId, command.workspaceId);
+    }
+    try {
+      await nativeWearBridge.openOnPhone(route);
+      if (target) navigateToHostWorkspaceRoute(route);
+      return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+    } catch {
+      return createWatchErrorResponse({
+        id: command.id,
+        code: "ACTION_FAILED",
+        message: "Could not open Paseo on the phone",
+      });
+    }
   }
 
   private async openSession(
@@ -661,7 +827,7 @@ export class WearBridgeCoordinator {
   }
 
   private success(id: string, snapshot: WatchSnapshot): WatchResponse {
-    return { v: 1, id, ok: true, snapshot };
+    return { v: 1, id, ok: true, snapshot: this.withVoice(snapshot) };
   }
 }
 
