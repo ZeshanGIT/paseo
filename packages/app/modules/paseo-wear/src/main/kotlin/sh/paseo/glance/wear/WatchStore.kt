@@ -12,6 +12,10 @@ data class WatchUiState(
 /** Process-local UI cache with optimistic outgoing messages reconciled against phone snapshots. */
 object WatchStore {
   private val mutableState = MutableStateFlow(WatchUiState())
+  @Volatile private var activeVoiceOverride: WatchVoice? = null
+  @Volatile private var terminalVoiceOverride: WatchVoice? = null
+  @Volatile private var suppressedVoiceId: String? = null
+  @Volatile private var captureControllerVoiceId: String? = null
   val state = mutableState.asStateFlow()
 
   fun loading() {
@@ -78,16 +82,131 @@ object WatchStore {
     )
   }
 
+  fun voicePhase(voiceId: String, phase: WatchVoicePhase) {
+    val state = mutableState.value
+    val snapshot = state.snapshot ?: return
+    val voice = activeVoiceOverride?.takeIf { it.voiceId == voiceId }
+      ?: snapshot.voice?.takeIf { it.voiceId == voiceId }
+      ?: return
+    val active = voice.copy(phase = phase)
+    activeVoiceOverride = active
+    mutableState.value = state.copy(
+      snapshot = snapshot.copy(voice = active),
+      loading = phase == WatchVoicePhase.UPLOADING || phase == WatchVoicePhase.TRANSCRIBING,
+      error = null,
+    )
+  }
+
+  fun beginVoice(voiceId: String) {
+    val active = WatchVoice(voiceId, WatchVoicePhase.RECORDING, null, null, null)
+    activeVoiceOverride = active
+    terminalVoiceOverride = null
+    suppressedVoiceId = null
+    captureControllerVoiceId = voiceId
+    val state = mutableState.value
+    val snapshot = state.snapshot ?: return
+    mutableState.value = state.copy(
+      snapshot = snapshot.copy(
+        voice = active,
+      ),
+      loading = false,
+      error = null,
+    )
+  }
+
+  fun clearVoice(voiceId: String?) {
+    activeVoiceOverride = null
+    terminalVoiceOverride = null
+    suppressedVoiceId = voiceId
+    captureControllerVoiceId = null
+    val state = mutableState.value
+    val snapshot = state.snapshot ?: return
+    mutableState.value = state.copy(
+      snapshot = snapshot.copy(
+        voice = snapshot.voice?.takeUnless { voiceId == null || it.voiceId == voiceId },
+      ),
+      loading = false,
+      error = null,
+    )
+  }
+
+  fun voiceError(voiceId: String, code: WatchVoiceErrorCode, message: String) {
+    val state = mutableState.value
+    val snapshot = state.snapshot ?: return
+    val voice = snapshot.voice?.takeIf { it.voiceId == voiceId }
+      ?: WatchVoice(voiceId, WatchVoicePhase.ERROR, null, code, message)
+    val terminal = voice.copy(
+      phase = WatchVoicePhase.ERROR,
+      errorCode = code,
+      errorMessage = message,
+    )
+    terminalVoiceOverride = terminal
+    activeVoiceOverride = null
+    suppressedVoiceId = null
+    captureControllerVoiceId = null
+    mutableState.value = state.copy(
+      snapshot = snapshot.copy(
+        voice = terminal,
+      ),
+      loading = false,
+      error = null,
+    )
+  }
+
+  /** Activity/process recreation has no AudioRecord controller to resume an in-flight capture. */
+  fun abandonActiveVoice() {
+    captureControllerVoiceId = null
+    val state = mutableState.value
+    val source = activeVoiceOverride ?: state.snapshot?.voice
+    activeVoiceOverride = null
+    if (source?.phase !in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING)) return
+    val interrupted = interruptedVoice(source!!)
+    terminalVoiceOverride = interrupted
+    state.snapshot?.let { snapshot ->
+      mutableState.value = state.copy(
+        snapshot = snapshot.copy(voice = interrupted),
+        loading = false,
+        error = null,
+      )
+    }
+  }
+
   private fun reconcile(previous: WatchSnapshot?, incoming: WatchSnapshot): WatchSnapshot {
-    val priorConversation = previous?.conversation ?: return incoming
-    val nextConversation = incoming.conversation ?: return incoming
+    val priorVoice = previous?.voice
+    val nextVoice = incoming.voice
+    if (
+      activeVoiceOverride?.voiceId == nextVoice?.voiceId &&
+        nextVoice?.phase in listOf(WatchVoicePhase.CONFIRMATION, WatchVoicePhase.ERROR)
+    ) {
+      activeVoiceOverride = null
+      captureControllerVoiceId = null
+    }
+    val orphanActiveSnapshot = activeVoiceOverride == null &&
+      terminalVoiceOverride == null &&
+      captureControllerVoiceId == null
+    val reconciledVoice = reconcileVoiceState(
+      priorVoice,
+      nextVoice,
+      activeVoiceOverride,
+      terminalVoiceOverride,
+      suppressedVoiceId,
+      orphanActiveSnapshot,
+    )
+    if (
+      orphanActiveSnapshot &&
+        nextVoice?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING) &&
+        reconciledVoice?.phase == WatchVoicePhase.ERROR
+    ) terminalVoiceOverride = reconciledVoice
+    val withVoice = incoming.copy(voice = reconciledVoice)
+    val priorConversation = previous?.conversation ?: return withVoice
+    val nextConversation = incoming.conversation ?: return withVoice
     if (
       priorConversation.workspaceId != nextConversation.workspaceId ||
         priorConversation.agentId != nextConversation.agentId
-    ) return incoming
+    ) return withVoice
 
     val pending = priorConversation.messages.filter(WatchMessage::pending)
-    if (pending.isEmpty()) return incoming
+    if (pending.isEmpty()) return withVoice
     val priorCanonicalIds = priorConversation.messages.filterNot(WatchMessage::pending).mapTo(mutableSetOf()) { it.id }
     val unmatched = pending.filterNot { optimistic ->
       nextConversation.messages.any { canonical ->
@@ -96,8 +215,44 @@ object WatchStore {
           (canonical.id !in priorCanonicalIds || canonical.timestamp >= optimistic.timestamp - 30_000L)
       }
     }
-    return incoming.copy(
+    return withVoice.copy(
       conversation = nextConversation.copy(messages = nextConversation.messages + unmatched),
     )
   }
 }
+
+internal fun reconcileVoiceState(
+  previous: WatchVoice?,
+  incoming: WatchVoice?,
+  activeOverride: WatchVoice?,
+  terminalOverride: WatchVoice?,
+  suppressedVoiceId: String?,
+  orphanActiveSnapshot: Boolean = false,
+): WatchVoice? {
+  if (suppressedVoiceId != null && incoming?.voiceId == suppressedVoiceId) return null
+  terminalOverride?.let { return it }
+  activeOverride?.let { active ->
+    if (
+      incoming?.voiceId == active.voiceId &&
+        incoming.phase in listOf(WatchVoicePhase.CONFIRMATION, WatchVoicePhase.ERROR)
+    ) return incoming
+    return active
+  }
+  if (
+    orphanActiveSnapshot &&
+      incoming?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING)
+  ) return interruptedVoice(requireNotNull(incoming))
+  return when {
+    previous?.voiceId != incoming?.voiceId -> incoming
+    previous?.phase == WatchVoicePhase.UPLOADING && incoming?.phase == WatchVoicePhase.RECORDING -> previous
+    previous?.phase == WatchVoicePhase.TRANSCRIBING && incoming?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING) -> previous
+    previous?.phase == WatchVoicePhase.ERROR && incoming?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING) -> previous
+    else -> incoming
+  }
+}
+
+private fun interruptedVoice(voice: WatchVoice) = voice.copy(
+  phase = WatchVoicePhase.ERROR,
+  errorCode = WatchVoiceErrorCode.AUDIO_INTERRUPTED,
+  errorMessage = "Recording interrupted",
+)

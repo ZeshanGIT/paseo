@@ -33,4 +33,15 @@ class ProtocolTest {
   @Test fun rejectsFutureProtocolVersion() {
     assertNull(WatchProtocol.decodeResponse("""{"v":2,"id":"one","ok":true}""".encodeToByteArray()))
   }
+
+  @Test fun voiceCommandAndConfirmationSnapshotMirrorFrozenContract() {
+    val encoded = WatchProtocol.encode(WatchCommand("voice", CommandKind.STOP_VOICE_INPUT, voiceId = "v1", byteLength = 320, sha256 = "abc"))
+    val json = JSONObject(encoded.decodeToString())
+    assertEquals("STOP_VOICE_INPUT", json.getString("kind"))
+    assertEquals("v1", json.getString("voiceId"))
+    assertEquals(320, json.getInt("byteLength"))
+    val snapshot = WatchProtocol.decodeSnapshotJson("""{"v":1,"generation":3,"connection":"paired_phone_available","projects":[],"sessions":[],"voice":{"voiceId":"v1","phase":"confirmation","transcript":"hello"}}""")
+    assertEquals(WatchVoicePhase.CONFIRMATION, snapshot?.voice?.phase)
+    assertEquals("hello", snapshot?.voice?.transcript)
+  }
 }

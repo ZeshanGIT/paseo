@@ -10,6 +10,7 @@ object WatchProtocol {
   const val REQUEST_PATH = "/paseo-glance/request"
   const val RESPONSE_PATH = "/paseo-glance/response"
   const val SNAPSHOT_PATH = "/paseo-glance/snapshot"
+  const val VOICE_CHANNEL_PREFIX = "/paseo-glance/voice/v1/"
 
   fun encode(command: WatchCommand): ByteArray = JSONObject().apply {
     put("v", VERSION)
@@ -19,6 +20,10 @@ object WatchProtocol {
     command.workspaceId?.let { put("workspaceId", it) }
     command.agentId?.let { put("agentId", it) }
     command.text?.let { put("text", it) }
+    command.voiceId?.let { put("voiceId", it) }
+    command.format?.let { put("format", it) }
+    command.byteLength?.let { put("byteLength", it) }
+    command.sha256?.let { put("sha256", it) }
   }.toString().encodeToByteArray()
 
   fun decodeResponse(bytes: ByteArray): WatchResponse? = runCatching {
@@ -48,6 +53,7 @@ object WatchProtocol {
       sessions = json.optJSONArray("sessions").toSessions(),
       active = json.optJSONObject("active")?.toSession(),
       conversation = json.optJSONObject("conversation")?.toConversation(),
+      voice = json.optJSONObject("voice")?.toVoice(),
     )
   }.getOrNull()
 
@@ -60,6 +66,19 @@ object WatchProtocol {
         }
       }
     }
+  }
+
+  private fun JSONObject.toVoice(): WatchVoice? {
+    val voiceId = optString("voiceId")
+    val phase = WatchVoicePhase.fromWire(optString("phase"))
+    if (voiceId.isBlank() || phase == null) return null
+    return WatchVoice(
+      voiceId = voiceId,
+      phase = phase,
+      transcript = optString("transcript").takeIf(String::isNotBlank),
+      errorCode = WatchVoiceErrorCode.fromWire(optString("errorCode")),
+      errorMessage = optString("errorMessage").takeIf(String::isNotBlank),
+    )
   }
 
   private fun JSONArray?.toSessions(): List<WatchSession> = buildList {
@@ -148,7 +167,13 @@ object WatchProtocol {
   }
 }
 
-enum class CommandKind { GET_SNAPSHOT, GET_PROJECTS, GET_SESSIONS, OPEN_SESSION, LOAD_OLDER_MESSAGES, CREATE_SESSION, SEND_PROMPT }
+enum class CommandKind { GET_SNAPSHOT, GET_PROJECTS, GET_SESSIONS, OPEN_SESSION, LOAD_OLDER_MESSAGES, CREATE_SESSION, SEND_PROMPT, START_VOICE_INPUT, STOP_VOICE_INPUT, CANCEL_VOICE_INPUT, SEND_TRANSCRIPT, OPEN_ON_PHONE }
+enum class WatchVoicePhase { READY, RECORDING, UPLOADING, TRANSCRIBING, CONFIRMATION, ERROR;
+  companion object { fun fromWire(value: String) = entries.firstOrNull { it.name.equals(value, true) } }
+}
+enum class WatchVoiceErrorCode { PHONE_UNAVAILABLE, MIC_PERMISSION_DENIED, AUDIO_INTERRUPTED, UPLOAD_FAILED, TRANSCRIPTION_FAILED, TRANSCRIPT_EMPTY, CANCELED;
+  companion object { fun fromWire(value: String) = entries.firstOrNull { it.name.equals(value, true) } }
+}
 enum class WatchConnection { PAIRED_PHONE_AVAILABLE, UNAVAILABLE }
 enum class WatchMessageRole {
   USER, ASSISTANT;
@@ -182,6 +207,10 @@ data class WatchCommand(
   val workspaceId: String? = null,
   val agentId: String? = null,
   val text: String? = null,
+  val voiceId: String? = null,
+  val format: String? = null,
+  val byteLength: Int? = null,
+  val sha256: String? = null,
 )
 data class WatchProject(val projectId: String, val label: String)
 data class WatchSession(
@@ -234,5 +263,7 @@ data class WatchSnapshot(
   val sessions: List<WatchSession>,
   val active: WatchSession?,
   val conversation: WatchConversation?,
+  val voice: WatchVoice? = null,
 )
+data class WatchVoice(val voiceId: String, val phase: WatchVoicePhase, val transcript: String?, val errorCode: WatchVoiceErrorCode?, val errorMessage: String?)
 data class WatchResponse(val id: String, val ok: Boolean, val snapshot: WatchSnapshot?, val error: String?)

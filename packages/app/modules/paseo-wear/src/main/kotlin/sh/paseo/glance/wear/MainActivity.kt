@@ -1,6 +1,12 @@
 package sh.paseo.glance.wear
 
 import android.os.Bundle
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.util.Log
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -24,6 +30,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -63,6 +71,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
@@ -70,6 +79,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 
 private typealias SendCommand = (CommandKind, String?, String?, String?, String?) -> Unit
 
@@ -98,10 +109,21 @@ private sealed interface Destination {
 class MainActivity : ComponentActivity() {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private lateinit var transport: WatchTransport
+  private var voiceJob: Job? = null
+  private var voiceCapture: VoiceCapture? = null
+  private var activeVoiceId: String? = null
+  private val voiceGeneration = VoiceCaptureGeneration()
+  private var voiceTarget: Pair<String, String>? = null
   private val preferences by lazy { getSharedPreferences("paseo_glance", MODE_PRIVATE) }
+  private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    val target = voiceTarget
+    voiceTarget = null
+    if (granted && target != null) startVoice(target.first, target.second) else WatchStore.failure("Microphone permission required")
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    WatchStore.abandonActiveVoice()
     transport = WatchTransport(applicationContext)
     setContent {
       var viewMode by rememberSaveable {
@@ -118,6 +140,10 @@ class MainActivity : ComponentActivity() {
         Surface(modifier = Modifier.fillMaxSize(), color = PaseoPalette.Background) {
           PaseoGlanceScreen(
             send = ::send,
+            onMicrophone = ::requestVoice,
+            onFinishVoice = ::finishVoice,
+            onCancelVoice = ::cancelVoice,
+            onSendTranscript = ::sendTranscript,
             viewMode = viewMode,
             onViewModeChange = { next ->
               viewMode = next
@@ -130,12 +156,109 @@ class MainActivity : ComponentActivity() {
     send(CommandKind.GET_SNAPSHOT)
   }
 
+  private fun requestVoice(workspaceId: String, agentId: String) {
+    if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+      voiceTarget = workspaceId to agentId
+      microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+    } else startVoice(workspaceId, agentId)
+  }
+
+  private fun startVoice(workspaceId: String, agentId: String) {
+    if (voiceJob?.isActive == true) return
+    val voiceId = java.util.UUID.randomUUID().toString()
+    val generation = voiceGeneration.next()
+    val capture = VoiceCapture(applicationContext)
+    voiceCapture = capture
+    activeVoiceId = voiceId
+    WatchStore.beginVoice(voiceId)
+    voiceJob = scope.launch(Dispatchers.IO) {
+      try {
+        if (!voiceGeneration.isCurrent(generation)) return@launch
+        Log.i("PaseoVoice", "start voiceId=$voiceId")
+        val start = transport.request(CommandKind.START_VOICE_INPUT, workspaceId = workspaceId, agentId = agentId, voiceId = voiceId, format = VoiceCapture.FORMAT)
+        transport.send(start).onFailure { WatchStore.failure("Phone unavailable") }.getOrElse { return@launch }
+        if (!voiceGeneration.isCurrent(generation)) {
+          transport.send(transport.request(CommandKind.CANCEL_VOICE_INPUT, voiceId = voiceId))
+          return@launch
+        }
+        val node = transport.reachableNodes().firstOrNull() ?: run { WatchStore.failure("Phone unavailable"); return@launch }
+        runCatching { capture.recordAndUpload(voiceId, node.id) { voiceGeneration.isCurrent(generation) } }
+          .onSuccess { result ->
+            if (!voiceGeneration.isCurrent(generation)) return@onSuccess
+            Log.i("PaseoVoice", "upload complete voiceId=$voiceId bytes=${result.byteLength}; sending STOP")
+            transport.send(transport.request(CommandKind.STOP_VOICE_INPUT, voiceId = voiceId, byteLength = result.byteLength, sha256 = result.sha256))
+              .onFailure {
+                if (voiceGeneration.isCurrent(generation)) WatchStore.voiceError(voiceId, WatchVoiceErrorCode.UPLOAD_FAILED, "Audio transfer failed")
+              }
+          }
+          .onFailure {
+            if (it is CancellationException) return@onFailure
+            if (!voiceGeneration.isCurrent(generation)) return@onFailure
+            Log.e("PaseoVoice", "voice failed voiceId=$voiceId", it)
+            transport.send(transport.request(CommandKind.CANCEL_VOICE_INPUT, voiceId = voiceId))
+            val interrupted = it.message?.contains("interrupted", true) == true
+            WatchStore.voiceError(
+              voiceId,
+              if (interrupted) WatchVoiceErrorCode.AUDIO_INTERRUPTED else WatchVoiceErrorCode.UPLOAD_FAILED,
+              if (interrupted) "Audio interrupted" else "Audio transfer failed",
+            )
+          }
+      } finally {
+        if (voiceCapture === capture) {
+          voiceCapture = null
+          activeVoiceId = null
+        }
+      }
+    }
+    haptic()
+  }
+
+  private fun cancelVoice(voiceId: String?) {
+    val cancelId = activeVoiceId ?: voiceId
+    voiceGeneration.invalidate()
+    val capture = voiceCapture
+    val job = voiceJob
+    voiceJob = null
+    voiceCapture = null
+    activeVoiceId = null
+    WatchStore.clearVoice(cancelId)
+    capture?.cancel()
+    job?.cancel()
+    if (cancelId != null) send(CommandKind.CANCEL_VOICE_INPUT, text = null, workspaceId = null, agentId = null, projectId = null, voiceId = cancelId)
+    haptic()
+  }
+
+  private fun finishVoice() {
+    val voiceId = activeVoiceId ?: return
+    if (voiceCapture?.finish() == true) {
+      Log.i("PaseoVoice", "finish voiceId=$voiceId")
+      WatchStore.voicePhase(voiceId, WatchVoicePhase.UPLOADING)
+      haptic()
+    }
+  }
+
+  private fun sendTranscript(voiceId: String, workspaceId: String, agentId: String, text: String) {
+    scope.launch {
+      transport.send(transport.request(CommandKind.SEND_TRANSCRIPT, workspaceId = workspaceId, agentId = agentId, text = text, voiceId = voiceId))
+        .onFailure { WatchStore.failure("Couldn’t send transcript") }
+    }
+  }
+
+  private fun haptic() {
+    runCatching {
+      (getSystemService(VIBRATOR_SERVICE) as? Vibrator)?.vibrate(
+        VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE),
+      )
+    }
+  }
+
   private fun send(
     kind: CommandKind,
     projectId: String? = null,
     workspaceId: String? = null,
     agentId: String? = null,
     text: String? = null,
+    voiceId: String? = null,
   ) {
     if (
       kind == CommandKind.SEND_PROMPT &&
@@ -147,7 +270,7 @@ class MainActivity : ComponentActivity() {
     }
     WatchStore.loading()
     scope.launch {
-      transport.send(transport.request(kind, projectId, workspaceId, agentId, text))
+      transport.send(transport.request(kind, projectId, workspaceId, agentId, text, voiceId = voiceId))
         .onFailure { WatchStore.failure(it.message ?: "Phone unavailable") }
     }
   }
@@ -157,6 +280,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun PaseoGlanceScreen(
   send: SendCommand,
+  onMicrophone: (String, String) -> Unit,
+  onFinishVoice: () -> Unit,
+  onCancelVoice: (String?) -> Unit,
+  onSendTranscript: (String, String, String, String) -> Unit,
   viewMode: WatchViewMode,
   onViewModeChange: (WatchViewMode) -> Unit,
 ) {
@@ -203,6 +330,10 @@ private fun PaseoGlanceScreen(
           send = send,
           viewMode = viewMode,
           onViewModeChange = onViewModeChange,
+          onMicrophone = onMicrophone,
+          onFinishVoice = onFinishVoice,
+          onCancelVoice = onCancelVoice,
+          onSendTranscript = onSendTranscript,
         ) { destination = current.parent }
       }
     }
@@ -286,6 +417,10 @@ private fun ConversationScreen(
   send: SendCommand,
   viewMode: WatchViewMode,
   onViewModeChange: (WatchViewMode) -> Unit,
+  onMicrophone: (String, String) -> Unit,
+  onFinishVoice: () -> Unit,
+  onCancelVoice: (String?) -> Unit,
+  onSendTranscript: (String, String, String, String) -> Unit,
   goBack: () -> Unit,
 ) {
   val session = snapshot.sessions.firstOrNull { it.workspaceId == destination.workspaceId }
@@ -592,32 +727,27 @@ private fun ConversationScreen(
           fontSize = 12.sp,
         )
       } else if (!composing) {
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-          verticalAlignment = Alignment.CenterVertically,
-        ) {
-          Text(
-            if (viewMode == WatchViewMode.GLANCE) "Switch to Full" else "Switch to Glance",
-            modifier = Modifier.background(PaseoPalette.Surface2, RoundedCornerShape(18.dp)).clickable(role = Role.Button) {
-              onViewModeChange(
-                if (viewMode == WatchViewMode.GLANCE) WatchViewMode.FULL else WatchViewMode.GLANCE,
-              )
-            }.padding(horizontal = 12.dp, vertical = 9.dp),
-            color = PaseoPalette.ForegroundMuted,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-          )
-          Text(
-            "⌨",
-            modifier = Modifier.background(PaseoPalette.Accent, CircleShape)
-              .semantics { contentDescription = "Compose message" }
-              .clickable(role = Role.Button) { composing = true }.padding(10.dp),
-            color = PaseoPalette.Foreground,
-            fontSize = 18.sp,
-          )
-        }
+        VoiceFooter(
+          voice = snapshot.voice,
+          viewMode = viewMode,
+          phoneAvailable = snapshot.connection == WatchConnection.PAIRED_PHONE_AVAILABLE,
+          onMicrophone = { onMicrophone(session!!.workspaceId, session.agentId!!) },
+          onFinishVoice = onFinishVoice,
+          onKeyboard = { composing = true },
+          onSwitch = { onViewModeChange(if (viewMode == WatchViewMode.GLANCE) WatchViewMode.FULL else WatchViewMode.GLANCE) },
+          onOpenPhone = { send(CommandKind.OPEN_ON_PHONE, null, session!!.workspaceId, session.agentId, null) },
+          onCancel = { onCancelVoice(snapshot.voice?.voiceId) },
+          onSendTranscript = { voiceId, text -> onSendTranscript(voiceId, session!!.workspaceId, session.agentId!!, text) },
+        )
       } else {
+        val submitPrompt = {
+          val value = prompt.trim()
+          if (value.isNotEmpty()) {
+            send(CommandKind.SEND_PROMPT, null, session!!.workspaceId, session.agentId, value)
+            prompt = ""
+            composing = false
+          }
+        }
         Row(
           modifier = Modifier.fillMaxWidth(),
           horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -626,10 +756,12 @@ private fun ConversationScreen(
           BasicTextField(
             value = prompt,
             onValueChange = { prompt = it },
-            modifier = Modifier.weight(1f).focusRequester(focusRequester).background(PaseoPalette.Surface2, RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier.weight(1f).focusRequester(focusRequester).background(PaseoPalette.Surface2, RoundedCornerShape(12.dp)).semantics { contentDescription = "Message" }.padding(horizontal = 10.dp, vertical = 8.dp),
             textStyle = TextStyle(color = PaseoPalette.Foreground, fontSize = 13.sp),
             cursorBrush = SolidColor(PaseoPalette.AccentBright),
             singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(onSend = { submitPrompt() }),
             decorationBox = { field ->
               if (prompt.isEmpty()) Text("Message", color = PaseoPalette.ForegroundMuted, fontSize = 13.sp)
               field()
@@ -640,12 +772,7 @@ private fun ConversationScreen(
             modifier = Modifier.background(PaseoPalette.Accent, RoundedCornerShape(12.dp))
               .semantics { contentDescription = "Send message" }
               .clickable(role = Role.Button) {
-              val value = prompt.trim()
-              if (value.isNotEmpty()) {
-                send(CommandKind.SEND_PROMPT, null, session.workspaceId, session.agentId, value)
-                prompt = ""
-                composing = false
-              }
+              submitPrompt()
             }.padding(horizontal = 12.dp, vertical = 6.dp),
             color = PaseoPalette.Foreground,
             fontWeight = FontWeight.Bold,
@@ -655,6 +782,77 @@ private fun ConversationScreen(
       }
     }
   }
+}
+
+@Composable
+private fun VoiceFooter(
+  voice: WatchVoice?,
+  viewMode: WatchViewMode,
+  phoneAvailable: Boolean,
+  onMicrophone: () -> Unit,
+  onFinishVoice: () -> Unit,
+  onKeyboard: () -> Unit,
+  onSwitch: () -> Unit,
+  onOpenPhone: () -> Unit,
+  onCancel: () -> Unit,
+  onSendTranscript: (String, String) -> Unit,
+) {
+  var transcript by remember(voice?.voiceId, voice?.transcript) { mutableStateOf(voice?.transcript.orEmpty()) }
+  Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    when (voice?.phase) {
+      WatchVoicePhase.CONFIRMATION -> {
+        Text("Review transcript", color = PaseoPalette.ForegroundMuted, fontSize = 11.sp)
+        BasicTextField(
+          value = transcript,
+          onValueChange = { transcript = it },
+          modifier = Modifier.fillMaxWidth().background(PaseoPalette.Surface2, RoundedCornerShape(12.dp)).semantics { contentDescription = "Transcript" }.padding(10.dp),
+          textStyle = TextStyle(color = PaseoPalette.Foreground, fontSize = 13.sp),
+          cursorBrush = SolidColor(PaseoPalette.AccentBright),
+          keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+          keyboardActions = KeyboardActions(onSend = {
+            if (transcript.isNotBlank()) onSendTranscript(voice.voiceId, transcript.trim())
+          }),
+        )
+        FooterButton("Send", enabled = transcript.isNotBlank()) { onSendTranscript(voice.voiceId, transcript.trim()) }
+        FooterButton("Record again") { onMicrophone() }
+        FooterButton("Cancel") { onCancel() }
+      }
+      WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING, WatchVoicePhase.TRANSCRIBING -> {
+        Text(if (voice.phase == WatchVoicePhase.RECORDING) "Recording…" else if (voice.phase == WatchVoicePhase.UPLOADING) "Sending audio…" else "Transcribing…", color = PaseoPalette.AccentBright, fontSize = 12.sp, modifier = Modifier.semantics { contentDescription = "Voice input ${voice.phase.name.lowercase()}" })
+        if (voice.phase == WatchVoicePhase.RECORDING) FooterButton("Finish recording") { onFinishVoice() }
+        FooterButton("Cancel") { onCancel() }
+      }
+      WatchVoicePhase.ERROR -> {
+        Text(voice.errorMessage ?: voiceErrorLabel(voice.errorCode), color = PaseoPalette.StatusDanger, fontSize = 12.sp)
+        FooterButton("Record again", enabled = phoneAvailable) { onMicrophone() }
+        FooterButton("Cancel") { onCancel() }
+      }
+      else -> {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
+          FooterCircleButton("Microphone", "●", phoneAvailable, onMicrophone)
+          FooterCircleButton("Keyboard", "⌨", true, onKeyboard)
+        }
+        FooterButton(if (viewMode == WatchViewMode.GLANCE) "Switch to Full" else "Switch to Glance", onClick = onSwitch)
+        FooterButton("Open on phone", enabled = phoneAvailable, onClick = onOpenPhone)
+        if (!phoneAvailable) Text("Phone unavailable. Keyboard remains available.", color = PaseoPalette.ForegroundMuted, fontSize = 10.sp)
+      }
+    }
+  }
+}
+
+@Composable private fun FooterCircleButton(label: String, glyph: String, enabled: Boolean, onClick: () -> Unit) {
+  Text(glyph, modifier = Modifier.size(48.dp).background(if (enabled) PaseoPalette.Accent else PaseoPalette.Surface2, CircleShape).semantics { contentDescription = label }.clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(top = 12.dp), color = PaseoPalette.Foreground, fontSize = 18.sp)
+}
+@Composable private fun FooterButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
+  Text(label, modifier = Modifier.fillMaxWidth().background(if (enabled) PaseoPalette.Surface2 else PaseoPalette.Background, RoundedCornerShape(18.dp)).semantics { contentDescription = label }.clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(horizontal = 12.dp, vertical = 10.dp), color = if (enabled) PaseoPalette.Foreground else PaseoPalette.ForegroundMuted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+}
+private fun voiceErrorLabel(code: WatchVoiceErrorCode?) = when (code) {
+  WatchVoiceErrorCode.MIC_PERMISSION_DENIED -> "Microphone permission required"
+  WatchVoiceErrorCode.AUDIO_INTERRUPTED -> "Audio interrupted"
+  WatchVoiceErrorCode.UPLOAD_FAILED -> "Audio transfer failed"
+  WatchVoiceErrorCode.TRANSCRIPT_EMPTY -> "No speech detected"
+  WatchVoiceErrorCode.TRANSCRIPTION_FAILED -> "Couldn’t transcribe"
+  else -> "Voice input unavailable"
 }
 
 @Composable
