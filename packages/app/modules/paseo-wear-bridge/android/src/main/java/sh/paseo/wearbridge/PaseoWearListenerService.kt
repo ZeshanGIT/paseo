@@ -8,6 +8,7 @@ import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.WearableListenerService
 import java.io.File
+import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -16,14 +17,41 @@ import org.json.JSONObject
 
 private const val VOICE_EXPIRY_MS = 60_000L
 private const val MAX_VOICE_BYTES = 2_000_000L
+internal const val MAX_VOICE_CHUNK_BYTES = 64 * 1024
 
 data class PendingVoiceTransfer(
   val nodeId: String,
   val file: File,
   val expiresAtMs: Long,
   @Volatile var uploadedBytes: Long? = null,
+  @Volatile var verifiedBytes: Long? = null,
   val receiving: AtomicBoolean = AtomicBoolean(false),
 )
+
+internal data class VoiceTransferChunk(
+  val bytes: ByteArray,
+  val eof: Boolean,
+)
+
+internal fun readVerifiedVoiceTransferChunk(
+  transfer: PendingVoiceTransfer,
+  offset: Long,
+  maxBytes: Int,
+): VoiceTransferChunk {
+  val verifiedBytes = transfer.verifiedBytes ?: throw IllegalStateException("Voice transfer is not verified")
+  require(offset in 0..verifiedBytes) { "Voice chunk offset is out of range" }
+  require(maxBytes in 1..MAX_VOICE_CHUNK_BYTES) { "Voice chunk size is out of range" }
+  if (transfer.file.length() != verifiedBytes) throw IllegalStateException("Voice transfer changed after verification")
+  if (offset == verifiedBytes) return VoiceTransferChunk(ByteArray(0), eof = true)
+
+  val bytesToRead = minOf(maxBytes.toLong(), verifiedBytes - offset).toInt()
+  val buffer = ByteArray(bytesToRead)
+  RandomAccessFile(transfer.file, "r").use { input ->
+    input.seek(offset)
+    input.readFully(buffer)
+  }
+  return VoiceTransferChunk(buffer, eof = offset + bytesToRead == verifiedBytes)
+}
 
 /** Private, bounded, one-use channel state. Raw audio never leaves app cache. */
 object VoiceTransferRegistry {
@@ -59,6 +87,16 @@ object VoiceTransferRegistry {
       cancel(voiceId)
       throw IllegalStateException("Voice transfer checksum failed")
     }
+    transfer.verifiedBytes = byteLength
+  }
+
+  internal fun readChunk(voiceId: String, offset: Long, maxBytes: Int): VoiceTransferChunk {
+    val transfer = pending[voiceId] ?: throw IllegalStateException("Unknown voice transfer")
+    if (System.currentTimeMillis() > transfer.expiresAtMs) {
+      cancel(voiceId)
+      throw IllegalStateException("Voice transfer expired")
+    }
+    return readVerifiedVoiceTransferChunk(transfer, offset, maxBytes)
   }
 
   fun cancel(voiceId: String) {

@@ -24,7 +24,7 @@ import {
 import { createWatchSnapshot } from "./reducer";
 import { WatchCommandDeliveryGuard } from "./command-delivery-guard";
 import {
-  createUnavailablePhoneLocalTranscriptionProvider,
+  createWearDaemonDictationProvider,
   type TranscriptionProvider,
 } from "./transcription-provider";
 import { navigateToHostWorkspaceRoute } from "@/navigation/workspace-route-navigation";
@@ -147,13 +147,18 @@ export class WearBridgeCoordinator {
   private watchedSessionGeneration = 0;
   private watchedRefreshChain: Promise<void> = Promise.resolve();
   private voice: WatchVoiceState | null = null;
+  private readonly voiceClients = new Map<string, DaemonClient>();
   private readonly transcriptionProvider: TranscriptionProvider;
   private readonly commandDeliveryGuard = new WatchCommandDeliveryGuard();
 
-  constructor(
-    transcriptionProvider: TranscriptionProvider = createUnavailablePhoneLocalTranscriptionProvider(),
-  ) {
-    this.transcriptionProvider = transcriptionProvider;
+  constructor(transcriptionProvider?: TranscriptionProvider) {
+    this.transcriptionProvider =
+      transcriptionProvider ??
+      createWearDaemonDictationProvider({
+        getConnectedClient: (voiceId) => this.voiceClients.get(voiceId) ?? null,
+        readVoiceTransferChunk: (voiceId, offset, maxBytes) =>
+          nativeWearBridge.readVoiceTransferChunk(voiceId, offset, maxBytes),
+      });
   }
 
   start(): void {
@@ -580,7 +585,8 @@ export class WearBridgeCoordinator {
         message: "Invalid voice request",
       });
     }
-    if (!findWorkspace(command)) {
+    const target = findWorkspace(command);
+    if (!target) {
       return createWatchErrorResponse({
         id: command.id,
         code: "NOT_FOUND",
@@ -590,6 +596,7 @@ export class WearBridgeCoordinator {
     if (this.voice) await this.cancelVoiceInput({ ...command, kind: "CANCEL_VOICE_INPUT" });
     try {
       await nativeWearBridge.registerVoiceTransfer(nodeId, command.voiceId);
+      this.voiceClients.set(command.voiceId, target.source.client);
       await this.setVoice({ voiceId: command.voiceId, phase: "recording" });
       return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
     } catch {
@@ -647,6 +654,7 @@ export class WearBridgeCoordinator {
     } finally {
       // V1 never retains raw Watch audio after the one transcription attempt.
       await nativeWearBridge.cancelVoiceTransfer(command.voiceId).catch(() => undefined);
+      this.voiceClients.delete(command.voiceId);
     }
     return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
   }
@@ -657,6 +665,7 @@ export class WearBridgeCoordinator {
         nativeWearBridge.cancelVoiceTransfer(command.voiceId),
         this.transcriptionProvider.cancel(command.voiceId),
       ]);
+      this.voiceClients.delete(command.voiceId);
     }
     if (!command.voiceId || this.voice?.voiceId === command.voiceId) await this.setVoice(null);
     return this.success(command.id, this.withVoice(getSnapshot(this.generation)));

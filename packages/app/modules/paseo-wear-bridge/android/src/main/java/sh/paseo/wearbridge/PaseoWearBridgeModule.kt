@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.util.Base64
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
@@ -113,6 +114,15 @@ class PaseoWearBridgeModule : Module() {
     AsyncFunction("finishVoiceTransfer") { voiceId: String, byteLength: Long, sha256: String ->
       VoiceTransferRegistry.finish(voiceId, byteLength, sha256)
       Unit
+    }
+
+    AsyncFunction("readVoiceTransferChunk") { voiceId: String, offset: Long, maxBytes: Int ->
+      val chunk = VoiceTransferRegistry.readChunk(voiceId, offset, maxBytes)
+      mapOf(
+        "base64" to Base64.encodeToString(chunk.bytes, Base64.NO_WRAP),
+        "nextOffset" to offset + chunk.bytes.size,
+        "eof" to chunk.eof,
+      )
     }
 
     AsyncFunction("cancelVoiceTransfer") { voiceId: String ->

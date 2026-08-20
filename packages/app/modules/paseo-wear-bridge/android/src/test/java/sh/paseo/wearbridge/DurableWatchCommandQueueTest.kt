@@ -1,5 +1,6 @@
 package sh.paseo.wearbridge
 
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -86,5 +87,62 @@ class DurableWatchCommandQueueTest {
     assertEquals("voice-1", voiceIdFromChannelPath("/paseo-glance/voice/v1/voice-1"))
     assertNull(voiceIdFromChannelPath("/paseo-glance/request"))
     assertNull(voiceIdFromChannelPath("/paseo-glance/voice/v1/"))
+  }
+
+  @Test
+  fun verifiedVoiceChunksAreBoundedAndReportEndOfFile() {
+    val file = File.createTempFile("wear-voice", ".pcm")
+    try {
+      file.writeBytes(byteArrayOf(1, 2, 3, 4, 5))
+      val transfer = PendingVoiceTransfer(
+        nodeId = "watch-node",
+        file = file,
+        expiresAtMs = Long.MAX_VALUE,
+        verifiedBytes = 5,
+      )
+
+      val first = readVerifiedVoiceTransferChunk(transfer, offset = 0, maxBytes = 3)
+      val last = readVerifiedVoiceTransferChunk(transfer, offset = 3, maxBytes = 3)
+      val end = readVerifiedVoiceTransferChunk(transfer, offset = 5, maxBytes = 1)
+
+      assertEquals(listOf<Byte>(1, 2, 3), first.bytes.toList())
+      assertFalse(first.eof)
+      assertEquals(listOf<Byte>(4, 5), last.bytes.toList())
+      assertTrue(last.eof)
+      assertEquals(0, end.bytes.size)
+      assertTrue(end.eof)
+    } finally {
+      file.delete()
+    }
+  }
+
+  @Test(expected = IllegalStateException::class)
+  fun unverifiedVoiceTransfersCannotBeRead() {
+    val file = File.createTempFile("wear-voice", ".pcm")
+    try {
+      file.writeBytes(byteArrayOf(1))
+      readVerifiedVoiceTransferChunk(
+        PendingVoiceTransfer("watch-node", file, Long.MAX_VALUE),
+        offset = 0,
+        maxBytes = 1,
+      )
+    } finally {
+      file.delete()
+    }
+  }
+
+  @Test(expected = IllegalArgumentException::class)
+  fun voiceChunkSizeHasAnUpperBound() {
+    val file = File.createTempFile("wear-voice", ".pcm")
+    try {
+      file.writeBytes(byteArrayOf(1))
+      readVerifiedVoiceTransferChunk(
+        PendingVoiceTransfer("watch-node", file, Long.MAX_VALUE, verifiedBytes = 1),
+        offset = 0,
+        maxBytes = MAX_VOICE_CHUNK_BYTES + 1,
+      )
+    } finally {
+      file.delete()
+    }
   }
 }
