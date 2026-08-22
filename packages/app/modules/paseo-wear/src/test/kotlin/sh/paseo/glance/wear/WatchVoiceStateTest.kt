@@ -50,4 +50,11 @@ class WatchVoiceStateTest {
     val confirmation = recording.copy(phase = WatchVoicePhase.CONFIRMATION, transcript = "hello")
     assertEquals(confirmation, reconcileVoiceState(recording, confirmation, recording, null, null))
   }
+
+  @Test fun confirmedTranscriptSurvivesLateTranscribingSnapshot() {
+    val confirmation = recording.copy(phase = WatchVoicePhase.CONFIRMATION, transcript = "hello")
+    val staleTranscribing = confirmation.copy(phase = WatchVoicePhase.TRANSCRIBING, transcript = null)
+
+    assertEquals(confirmation, reconcileVoiceState(confirmation, staleTranscribing, null, null, null))
+  }
 }

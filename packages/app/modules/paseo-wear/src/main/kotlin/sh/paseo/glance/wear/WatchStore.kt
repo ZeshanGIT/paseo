@@ -244,6 +244,13 @@ internal fun reconcileVoiceState(
   ) return interruptedVoice(requireNotNull(incoming))
   return when {
     previous?.voiceId != incoming?.voiceId -> incoming
+    previous?.phase == WatchVoicePhase.CONFIRMATION &&
+      incoming?.phase in listOf(
+        WatchVoicePhase.PREVIEW,
+        WatchVoicePhase.RECORDING,
+        WatchVoicePhase.UPLOADING,
+        WatchVoicePhase.TRANSCRIBING,
+      ) -> previous
     previous?.phase == WatchVoicePhase.UPLOADING && incoming?.phase == WatchVoicePhase.RECORDING -> previous
     previous?.phase == WatchVoicePhase.TRANSCRIBING && incoming?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING) -> previous
     previous?.phase == WatchVoicePhase.ERROR && incoming?.phase in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING) -> previous
