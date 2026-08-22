@@ -4,7 +4,7 @@ import {
   useSessionStore,
   type SessionState,
 } from "@/stores/session-store";
-import { latestWatchActivity } from "./activity";
+import { hasRunningWatchActivity, latestWatchActivity } from "./activity";
 import { nativeWearBridge, type NativeWatchCommandEvent } from "./bridge";
 import {
   latestAssistantReply,
@@ -373,6 +373,7 @@ export class WearBridgeCoordinator {
     let sawNewReply = false;
     let lastReply = previousReply;
     let stableFinishedPolls = 0;
+    let activityRunning = false;
 
     const poll = async () => {
       if (pollGeneration !== this.replyPollGeneration) return;
@@ -388,8 +389,9 @@ export class WearBridgeCoordinator {
         const running = liveSession
           ? selectAgentTurnPresentation(liveSession, agentId).isActive
           : false;
+        activityRunning = this.hasRunningWatchedActivity(liveSession, agentId);
         const explicitlyFinished = isExplicitlyFinishedAgent(agent);
-        if (sawNewReply && !running && reply === lastReply) {
+        if (sawNewReply && !running && !activityRunning && reply === lastReply) {
           stableFinishedPolls += 1;
           if (stableFinishedPolls >= (explicitlyFinished ? 1 : 2)) {
             this.completeWatchedTurn();
@@ -405,7 +407,7 @@ export class WearBridgeCoordinator {
         console.warn("[WearBridge] Reply refresh failed", error);
       }
       if (pollGeneration !== this.replyPollGeneration) return;
-      if (pollGeneration === this.replyPollGeneration && attempts < 80) {
+      if (pollGeneration === this.replyPollGeneration && (attempts < 80 || activityRunning)) {
         this.replyPollTimer = setTimeout(() => void poll(), 1_500);
       } else {
         this.completeWatchedTurn();
@@ -422,6 +424,20 @@ export class WearBridgeCoordinator {
     this.replyPollTimer = null;
     this.replyPollingActive = false;
     this.replyPollGeneration += 1;
+  }
+
+  private hasRunningWatchedActivity(session: SessionState | undefined, agentId: string): boolean {
+    const streamItems = session
+      ? [
+          ...(session.agentStreamTail.get(agentId) ?? []),
+          ...(session.agentStreamHead.get(agentId) ?? []),
+        ]
+      : [];
+    if (hasRunningWatchActivity(streamItems)) return true;
+    return (
+      this.conversationCache?.agentId === agentId &&
+      this.conversationCache.activities.some((activity) => activity.state === "running")
+    );
   }
 
   private finishReplyPolling(generation: number): void {

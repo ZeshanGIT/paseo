@@ -15,12 +15,13 @@ class ProtocolTest {
   }
 
   @Test fun responseDecodesCompactSnapshot() {
-    val response = WatchProtocol.decodeResponse("""{"v":1,"id":"one","ok":true,"snapshot":{"v":1,"generation":2,"connection":"paired_phone_available","projects":[{"projectId":"p","label":"Project"}],"sessions":[{"workspaceId":"w","projectId":"p","agentId":"a","label":"Session","state":"working","shortStatus":"Building","updatedAt":3,"pinnedAt":4,"latestReply":"Done","activeTurnStartedAt":10,"model":"gpt-5.6-sol","effort":"medium","currentActivity":{"id":"tool","kind":"tool","icon":"shell","label":"Shell","detail":"npm test","state":"running","timestamp":8,"sequence":3}}],"conversation":{"workspaceId":"w","agentId":"a","hasOlder":true,"currentStatus":"Running tests","summary":"**Done**","messages":[{"id":"e:1:1","role":"user","text":"Question","timestamp":5,"sequence":1},{"id":"e:2:2","role":"assistant","text":"Answer","timestamp":6,"sequence":2}],"activities":[{"id":"tool","kind":"tool","icon":"shell","label":"Shell","detail":"npm test","state":"completed","timestamp":8,"sequence":3}]}}}""".encodeToByteArray())
+    val response = WatchProtocol.decodeResponse("""{"v":1,"id":"one","ok":true,"snapshot":{"v":1,"generation":2,"connection":"paired_phone_available","projects":[{"projectId":"p","label":"Project"}],"sessions":[{"workspaceId":"w","projectId":"p","agentId":"a","label":"Session","state":"working","shortStatus":"Building","updatedAt":3,"pinnedAt":4,"latestReply":"Done","activeTurnStartedAt":10,"lastTurnDurationMs":4000,"model":"gpt-5.6-sol","effort":"medium","currentActivity":{"id":"tool","kind":"tool","icon":"shell","label":"Shell","detail":"npm test","state":"running","timestamp":8,"sequence":3}}],"conversation":{"workspaceId":"w","agentId":"a","hasOlder":true,"currentStatus":"Running tests","summary":"**Done**","messages":[{"id":"e:1:1","role":"user","text":"Question","timestamp":5,"sequence":1},{"id":"e:2:2","role":"assistant","text":"Answer","timestamp":6,"sequence":2}],"activities":[{"id":"tool","kind":"tool","icon":"shell","label":"Shell","detail":"npm test","state":"completed","timestamp":8,"sequence":3}]}}}""".encodeToByteArray())
     assertEquals(WatchConnection.PAIRED_PHONE_AVAILABLE, response?.snapshot?.connection)
     assertEquals("Project", response?.snapshot?.projects?.single()?.label)
     assertEquals(WatchState.WORKING, response?.snapshot?.sessions?.single()?.state)
     assertEquals("Done", response?.snapshot?.sessions?.single()?.latestReply)
     assertEquals(4L, response?.snapshot?.sessions?.single()?.pinnedAt)
+    assertEquals(4_000L, response?.snapshot?.sessions?.single()?.lastTurnDurationMs)
     assertEquals("gpt-5.6-sol", response?.snapshot?.sessions?.single()?.model)
     assertEquals(WatchActivityState.RUNNING, response?.snapshot?.sessions?.single()?.currentActivity?.state)
     assertEquals(listOf(WatchMessageRole.USER, WatchMessageRole.ASSISTANT), response?.snapshot?.conversation?.messages?.map { it.role })

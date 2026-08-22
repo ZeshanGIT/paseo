@@ -111,3 +111,7 @@ export function latestWatchActivity(items: readonly StreamItem[]): WatchActivity
   }
   return activities.at(-1);
 }
+
+export function hasRunningWatchActivity(items: readonly StreamItem[]): boolean {
+  return latestWatchActivity(items)?.state === "running";
+}

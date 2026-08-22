@@ -101,6 +101,7 @@ object WatchProtocol {
       pinnedAt = optLong("pinnedAt").takeIf { has("pinnedAt") },
       latestReply = optString("latestReply").takeIf(String::isNotBlank),
       activeTurnStartedAt = optLong("activeTurnStartedAt").takeIf { has("activeTurnStartedAt") },
+      lastTurnDurationMs = optLong("lastTurnDurationMs").takeIf { has("lastTurnDurationMs") },
       model = optString("model").takeIf(String::isNotBlank),
       effort = optString("effort").takeIf(String::isNotBlank),
       currentActivity = optJSONObject("currentActivity")?.toActivity(),

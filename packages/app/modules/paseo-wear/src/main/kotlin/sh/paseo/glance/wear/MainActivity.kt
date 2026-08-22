@@ -605,8 +605,7 @@ private fun ConversationScreen(
   }.map { message ->
     val token = if (
       ":summary:" in message.id &&
-        session?.lastTurnDurationMs != null &&
-        session.state != WatchState.WORKING
+        shouldShowCompletedTurnMetadata(session, activities, message)
     ) {
       "${message.id}:completed"
     } else {
@@ -764,12 +763,7 @@ private fun ConversationScreen(
               metadata = if (
                 row.value.role == WatchMessageRole.ASSISTANT &&
                   row.value.id == metadataTargetId &&
-                  session?.state != WatchState.WORKING &&
-                  (
-                    session?.lastTurnDurationMs != null ||
-                      session?.state == WatchState.COMPLETE ||
-                      session?.state == WatchState.FAILED
-                  )
+                  shouldShowCompletedTurnMetadata(session, activities, row.value)
               ) completedTurnMetadata(messages, row.value, session) else null,
             )
           }
