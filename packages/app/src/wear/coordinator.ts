@@ -890,6 +890,12 @@ export class WearBridgeCoordinator {
         this.latestRepliesByAgentId.get(target.agentId) ??
         null;
       this.beginWatchedTurn(Date.now());
+      // Publish the optimistic working state before awaiting the daemon call.
+      // `sendAgentMessage` can remain pending until the first stream/tool event,
+      // which otherwise leaves the watch with no visible progress indicator.
+      await this.publish().catch((error) =>
+        console.warn("[WearBridge] Initial working publish failed", error),
+      );
       await target.source.client.sendAgentMessage(target.agentId, command.text.trim());
       await this.publish();
       if (this.watchedWorkspaceId) {
@@ -911,6 +917,10 @@ export class WearBridgeCoordinator {
         ),
       );
     } catch {
+      this.completeWatchedTurn();
+      await this.publish().catch((error) =>
+        console.warn("[WearBridge] Failed to clear working state", error),
+      );
       return createWatchErrorResponse({
         id: command.id,
         code: "ACTION_FAILED",
