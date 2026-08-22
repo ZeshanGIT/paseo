@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.concurrent.thread
 
 class DurableWatchCommandQueueTest {
   private class MemoryStorage : WatchCommandStorage {
@@ -83,6 +84,30 @@ class DurableWatchCommandQueueTest {
   }
 
   @Test
+  fun everyWatchCommandStartsThePhoneRuntimeForColdDelivery() {
+    listOf(
+      "GET_SNAPSHOT",
+      "GET_PROJECTS",
+      "GET_SESSIONS",
+      "OPEN_SESSION",
+      "LOAD_OLDER_MESSAGES",
+      "CREATE_SESSION",
+      "SEND_PROMPT",
+      "START_VOICE_INPUT",
+      "STOP_VOICE_INPUT",
+      "CANCEL_VOICE_INPUT",
+      "SEND_TRANSCRIPT",
+      "OPEN_ON_PHONE",
+    ).forEach { kind -> assertTrue(shouldForeground(kind)) }
+  }
+
+  @Test
+  fun malformedWatchCommandsDoNotStartThePhoneRuntime() {
+    assertFalse(shouldForeground(null))
+    assertFalse(shouldForeground("UNKNOWN"))
+  }
+
+  @Test
   fun voiceChannelPathAcceptsOnlyTheRegisteredVoicePrefix() {
     assertEquals("voice-1", voiceIdFromChannelPath("/paseo-glance/voice/v1/voice-1"))
     assertNull(voiceIdFromChannelPath("/paseo-glance/request"))
@@ -141,6 +166,24 @@ class DurableWatchCommandQueueTest {
         offset = 0,
         maxBytes = MAX_VOICE_CHUNK_BYTES + 1,
       )
+    } finally {
+      file.delete()
+    }
+  }
+
+  @Test
+  fun finishingWaitsForTheChannelWriterToComplete() {
+    val file = File.createTempFile("wear-voice", ".pcm")
+    try {
+      val transfer = PendingVoiceTransfer("watch-node", file, System.currentTimeMillis() + 5_000)
+      thread {
+        Thread.sleep(50)
+        transfer.uploadedBytes = 4
+        transfer.uploadComplete.countDown()
+      }
+
+      assertTrue(VoiceTransferRegistry.awaitUploadCompletion(transfer, timeoutMs = 1_000))
+      assertEquals(4L, transfer.uploadedBytes)
     } finally {
       file.delete()
     }

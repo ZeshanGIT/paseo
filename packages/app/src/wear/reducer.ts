@@ -16,6 +16,12 @@ export interface WearWorkspace {
   statusEnteredAt: Date | null;
 }
 
+export interface WearProject {
+  projectId: string;
+  projectDisplayName: string;
+  projectCustomName?: string | null;
+}
+
 export interface WearAgent {
   id: string;
   workspaceId?: string;
@@ -35,6 +41,7 @@ export interface WearAgent {
 export interface WearSnapshotInput {
   generation: number;
   phoneAvailable: boolean;
+  projects?: Iterable<WearProject>;
   workspaces: Iterable<WearWorkspace>;
   agents: Iterable<WearAgent>;
   latestRepliesByAgentId?: ReadonlyMap<string, string>;
@@ -68,6 +75,12 @@ function toShortStatus(agent: WearAgent | null, turnActive = false): string {
 // eslint-disable-next-line complexity
 export function createWatchSnapshot(input: WearSnapshotInput): WatchSnapshot {
   const projectsById = new Map<string, WatchProject>();
+  for (const project of input.projects ?? []) {
+    projectsById.set(project.projectId, {
+      projectId: project.projectId,
+      label: project.projectCustomName ?? project.projectDisplayName,
+    });
+  }
   const agentsByWorkspace = new Map<string, WearAgent>();
   for (const agent of input.agents) {
     if (agent.workspaceId) agentsByWorkspace.set(agent.workspaceId, agent);
@@ -75,10 +88,12 @@ export function createWatchSnapshot(input: WearSnapshotInput): WatchSnapshot {
 
   const sessions: WatchSession[] = [];
   for (const workspace of input.workspaces) {
-    projectsById.set(workspace.projectId, {
-      projectId: workspace.projectId,
-      label: workspace.projectCustomName ?? workspace.projectDisplayName,
-    });
+    if (!projectsById.has(workspace.projectId)) {
+      projectsById.set(workspace.projectId, {
+        projectId: workspace.projectId,
+        label: workspace.projectCustomName ?? workspace.projectDisplayName,
+      });
+    }
     const agent = agentsByWorkspace.get(workspace.id) ?? null;
     const turnPresentation = agent ? input.turnPresentationByAgentId?.get(agent.id) : undefined;
     const activeTurnStartedAt = turnPresentation?.startedAt ?? agent?.activeTurn?.startedAt;

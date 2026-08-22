@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
@@ -24,6 +25,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -38,17 +41,23 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.material.ExperimentalMaterialApi
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.pullrefresh.PullRefreshIndicator
 import androidx.compose.material.pullrefresh.pullRefresh
 import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -59,8 +68,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
@@ -81,6 +95,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
 
 private typealias SendCommand = (CommandKind, String?, String?, String?, String?) -> Unit
 
@@ -112,8 +127,10 @@ class MainActivity : ComponentActivity() {
   private var voiceJob: Job? = null
   private var voiceCapture: VoiceCapture? = null
   private var activeVoiceId: String? = null
+  @Volatile private var voiceTransferStarted = false
   private val voiceGeneration = VoiceCaptureGeneration()
   private var voiceTarget: Pair<String, String>? = null
+  private val voiceLevel = MutableStateFlow(0f)
   private val preferences by lazy { getSharedPreferences("paseo_glance", MODE_PRIVATE) }
   private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
     val target = voiceTarget
@@ -144,6 +161,7 @@ class MainActivity : ComponentActivity() {
             onFinishVoice = ::finishVoice,
             onCancelVoice = ::cancelVoice,
             onSendTranscript = ::sendTranscript,
+            voiceLevel = voiceLevel,
             viewMode = viewMode,
             onViewModeChange = { next ->
               viewMode = next
@@ -168,42 +186,60 @@ class MainActivity : ComponentActivity() {
     val voiceId = java.util.UUID.randomUUID().toString()
     val generation = voiceGeneration.next()
     val capture = VoiceCapture(applicationContext)
+    voiceLevel.value = 0f
     voiceCapture = capture
     activeVoiceId = voiceId
+    voiceTransferStarted = true
     WatchStore.beginVoice(voiceId)
     voiceJob = scope.launch(Dispatchers.IO) {
       try {
         if (!voiceGeneration.isCurrent(generation)) return@launch
         Log.i("PaseoVoice", "start voiceId=$voiceId")
-        val start = transport.request(CommandKind.START_VOICE_INPUT, workspaceId = workspaceId, agentId = agentId, voiceId = voiceId, format = VoiceCapture.FORMAT)
-        transport.send(start).onFailure { WatchStore.failure("Phone unavailable") }.getOrElse { return@launch }
-        if (!voiceGeneration.isCurrent(generation)) {
-          transport.send(transport.request(CommandKind.CANCEL_VOICE_INPUT, voiceId = voiceId))
-          return@launch
-        }
-        val node = transport.reachableNodes().firstOrNull() ?: run { WatchStore.failure("Phone unavailable"); return@launch }
-        runCatching { capture.recordAndUpload(voiceId, node.id) { voiceGeneration.isCurrent(generation) } }
-          .onSuccess { result ->
-            if (!voiceGeneration.isCurrent(generation)) return@onSuccess
-            Log.i("PaseoVoice", "upload complete voiceId=$voiceId bytes=${result.byteLength}; sending STOP")
-            transport.send(transport.request(CommandKind.STOP_VOICE_INPUT, voiceId = voiceId, byteLength = result.byteLength, sha256 = result.sha256))
-              .onFailure {
-                if (voiceGeneration.isCurrent(generation)) WatchStore.voiceError(voiceId, WatchVoiceErrorCode.UPLOAD_FAILED, "Audio transfer failed")
-              }
-          }
-          .onFailure {
-            if (it is CancellationException) return@onFailure
-            if (!voiceGeneration.isCurrent(generation)) return@onFailure
-            Log.e("PaseoVoice", "voice failed voiceId=$voiceId", it)
+        val start = transport.request(
+          CommandKind.START_VOICE_INPUT,
+          workspaceId = workspaceId,
+          agentId = agentId,
+          voiceId = voiceId,
+          format = VoiceCapture.FORMAT,
+        )
+        transport.send(start).getOrElse { throw it }
+        if (!voiceGeneration.isCurrent(generation)) return@launch
+        val node = transport.reachableNodes().firstOrNull() ?: error("Phone unavailable")
+        val result = capture.recordToChannel(
+          voiceId = voiceId,
+          nodeId = node.id,
+          isCurrent = { voiceGeneration.isCurrent(generation) },
+          onLevel = { level -> voiceLevel.value = level },
+        )
+        if (!voiceGeneration.isCurrent(generation)) return@launch
+        WatchStore.voicePhase(voiceId, WatchVoicePhase.UPLOADING)
+        Log.i("PaseoVoice", "stream complete voiceId=$voiceId bytes=${result.byteLength}; sending STOP")
+        transport.send(
+          transport.request(
+            CommandKind.STOP_VOICE_INPUT,
+            voiceId = voiceId,
+            byteLength = result.byteLength,
+            sha256 = result.sha256,
+          ),
+        ).getOrElse { throw it }
+      } catch (error: CancellationException) {
+        throw error
+      } catch (error: Throwable) {
+        if (voiceGeneration.isCurrent(generation)) {
+          Log.e("PaseoVoice", "voice stream failed voiceId=$voiceId", error)
+          runCatching {
             transport.send(transport.request(CommandKind.CANCEL_VOICE_INPUT, voiceId = voiceId))
-            val interrupted = it.message?.contains("interrupted", true) == true
-            WatchStore.voiceError(
-              voiceId,
-              if (interrupted) WatchVoiceErrorCode.AUDIO_INTERRUPTED else WatchVoiceErrorCode.UPLOAD_FAILED,
-              if (interrupted) "Audio interrupted" else "Audio transfer failed",
-            )
           }
+          voiceTransferStarted = false
+          val interrupted = error.message?.contains("interrupted", true) == true
+          WatchStore.voiceError(
+            voiceId,
+            if (interrupted) WatchVoiceErrorCode.AUDIO_INTERRUPTED else WatchVoiceErrorCode.UPLOAD_FAILED,
+            if (interrupted) "Audio interrupted" else "Audio transfer failed",
+          )
+        }
       } finally {
+        voiceLevel.value = 0f
         if (voiceCapture === capture) {
           voiceCapture = null
           activeVoiceId = null
@@ -221,10 +257,14 @@ class MainActivity : ComponentActivity() {
     voiceJob = null
     voiceCapture = null
     activeVoiceId = null
+    val cancelPhoneTransfer = voiceTransferStarted
+    voiceTransferStarted = false
     WatchStore.clearVoice(cancelId)
     capture?.cancel()
     job?.cancel()
-    if (cancelId != null) send(CommandKind.CANCEL_VOICE_INPUT, text = null, workspaceId = null, agentId = null, projectId = null, voiceId = cancelId)
+    if (cancelPhoneTransfer && cancelId != null) {
+      send(CommandKind.CANCEL_VOICE_INPUT, text = null, workspaceId = null, agentId = null, projectId = null, voiceId = cancelId)
+    }
     haptic()
   }
 
@@ -232,7 +272,6 @@ class MainActivity : ComponentActivity() {
     val voiceId = activeVoiceId ?: return
     if (voiceCapture?.finish() == true) {
       Log.i("PaseoVoice", "finish voiceId=$voiceId")
-      WatchStore.voicePhase(voiceId, WatchVoicePhase.UPLOADING)
       haptic()
     }
   }
@@ -240,6 +279,10 @@ class MainActivity : ComponentActivity() {
   private fun sendTranscript(voiceId: String, workspaceId: String, agentId: String, text: String) {
     scope.launch {
       transport.send(transport.request(CommandKind.SEND_TRANSCRIPT, workspaceId = workspaceId, agentId = agentId, text = text, voiceId = voiceId))
+        .onSuccess {
+          voiceTransferStarted = false
+          WatchStore.clearVoice(voiceId)
+        }
         .onFailure { WatchStore.failure("Couldn’t send transcript") }
     }
   }
@@ -284,17 +327,28 @@ private fun PaseoGlanceScreen(
   onFinishVoice: () -> Unit,
   onCancelVoice: (String?) -> Unit,
   onSendTranscript: (String, String, String, String) -> Unit,
+  voiceLevel: MutableStateFlow<Float>,
   viewMode: WatchViewMode,
   onViewModeChange: (WatchViewMode) -> Unit,
 ) {
   val ui by WatchStore.state.collectAsState()
   val snapshot = ui.snapshot
   var destination by remember { mutableStateOf<Destination>(Destination.Home) }
+  var voiceScreen by remember { mutableStateOf(false) }
+  var conversationScrollToBottomKey by remember { mutableStateOf(0) }
+  val conversationListState = rememberLazyListState()
+  val liveVoiceLevel by voiceLevel.collectAsState()
   val refresh = { send(CommandKind.GET_SNAPSHOT, null, null, null, null) }
   val pullRefreshState = rememberPullRefreshState(ui.loading, refresh)
   val allowPullRefresh = destination !is Destination.Conversation
 
-  BackHandler(destination != Destination.Home) {
+  BackHandler(enabled = snapshot?.voice != null) {
+    onCancelVoice(snapshot?.voice?.voiceId)
+    conversationScrollToBottomKey += 1
+    voiceScreen = false
+  }
+
+  BackHandler(enabled = snapshot?.voice == null && destination != Destination.Home) {
     destination = when (val current = destination) {
       is Destination.Project -> current.parent
       is Destination.Conversation -> current.parent
@@ -310,6 +364,9 @@ private fun PaseoGlanceScreen(
       send(CommandKind.OPEN_SESSION, null, current.workspaceId, session?.agentId, null)
     }
   }
+  LaunchedEffect(snapshot?.voice?.voiceId) {
+    if (snapshot?.voice == null) voiceScreen = false
+  }
 
   val screenModifier =
     if (allowPullRefresh) Modifier.fillMaxSize().pullRefresh(pullRefreshState)
@@ -323,18 +380,40 @@ private fun PaseoGlanceScreen(
         Destination.Home -> HomeScreen(snapshot, refresh) { destination = it }
         Destination.Projects -> ProjectsScreen(snapshot, refresh) { destination = it }
         is Destination.Project -> ProjectScreen(snapshot, current, refresh) { destination = it }
-        is Destination.Conversation -> ConversationScreen(
-          snapshot = snapshot,
-          destination = current,
-          loading = ui.loading,
-          send = send,
-          viewMode = viewMode,
-          onViewModeChange = onViewModeChange,
-          onMicrophone = onMicrophone,
-          onFinishVoice = onFinishVoice,
-          onCancelVoice = onCancelVoice,
-          onSendTranscript = onSendTranscript,
-        ) { destination = current.parent }
+        is Destination.Conversation -> {
+          val session = snapshot.sessions.firstOrNull { it.workspaceId == current.workspaceId }
+          if (voiceScreen) {
+            VoiceInputScreen(
+              voice = snapshot.voice,
+              level = liveVoiceLevel,
+              onFinish = onFinishVoice,
+              onRecordAgain = {
+                session?.agentId?.let { onMicrophone(session.workspaceId, it) }
+              },
+              onEnter = { voiceId, transcript ->
+                session?.agentId?.let { agentId ->
+                  onSendTranscript(voiceId, session.workspaceId, agentId, transcript)
+                  voiceScreen = false
+                }
+              },
+            )
+          } else ConversationScreen(
+            snapshot = snapshot,
+            destination = current,
+            listState = conversationListState,
+            scrollToBottomKey = conversationScrollToBottomKey,
+            loading = ui.loading,
+            send = send,
+            viewMode = viewMode,
+            onViewModeChange = onViewModeChange,
+            onMicrophone = { workspaceId, agentId ->
+              voiceScreen = true
+              onMicrophone(workspaceId, agentId)
+            },
+            onFinishVoice = onFinishVoice,
+            onSendTranscript = onSendTranscript,
+          ) { destination = current.parent }
+        }
       }
     }
 
@@ -413,13 +492,14 @@ private fun ProjectScreen(
 private fun ConversationScreen(
   snapshot: WatchSnapshot,
   destination: Destination.Conversation,
+  listState: androidx.compose.foundation.lazy.LazyListState,
+  scrollToBottomKey: Int,
   loading: Boolean,
   send: SendCommand,
   viewMode: WatchViewMode,
   onViewModeChange: (WatchViewMode) -> Unit,
   onMicrophone: (String, String) -> Unit,
   onFinishVoice: () -> Unit,
-  onCancelVoice: (String?) -> Unit,
   onSendTranscript: (String, String, String, String) -> Unit,
   goBack: () -> Unit,
 ) {
@@ -448,16 +528,21 @@ private fun ConversationScreen(
   var positionedGlanceIds by remember(destination.workspaceId) { mutableStateOf(emptySet<String>()) }
   var glanceFocusSeeded by remember(destination.workspaceId) { mutableStateOf(false) }
   val focusRequester = remember { FocusRequester() }
-  val listState = rememberLazyListState()
+  var lastAppliedScrollToBottomKey by remember(destination.workspaceId, viewMode) { mutableStateOf(0) }
 
   BackHandler(composing) { composing = false }
   LaunchedEffect(composing) {
     if (composing) focusRequester.requestFocus()
   }
-  LaunchedEffect(timelineRows.size, loading, viewMode) {
-    if (!positionedAtNewest && conversation != null && !loading) {
-      listState.scrollToItem(timelineRows.size + 2)
+  LaunchedEffect(timelineRows.size, loading, viewMode, conversation?.workspaceId, scrollToBottomKey) {
+    val shouldScrollToBottom = scrollToBottomKey > lastAppliedScrollToBottomKey
+    if ((!positionedAtNewest || shouldScrollToBottom) && conversation != null && !loading) {
+      withFrameNanos { }
+      withFrameNanos { }
+      val lastItem = maxOf(listState.layoutInfo.totalItemsCount - 1, timelineRows.size + 2)
+      listState.scrollToItem(lastItem)
       positionedAtNewest = true
+      if (shouldScrollToBottom) lastAppliedScrollToBottomKey = scrollToBottomKey
     } else if (loadingOlder && !loading) {
       val added = (timelineRows.size - rowCountBeforeOlderLoad).coerceAtLeast(0)
       if (added > 0) listState.scrollToItem(added + 2)
@@ -736,7 +821,6 @@ private fun ConversationScreen(
           onKeyboard = { composing = true },
           onSwitch = { onViewModeChange(if (viewMode == WatchViewMode.GLANCE) WatchViewMode.FULL else WatchViewMode.GLANCE) },
           onOpenPhone = { send(CommandKind.OPEN_ON_PHONE, null, session!!.workspaceId, session.agentId, null) },
-          onCancel = { onCancelVoice(snapshot.voice?.voiceId) },
           onSendTranscript = { voiceId, text -> onSendTranscript(voiceId, session!!.workspaceId, session.agentId!!, text) },
         )
       } else {
@@ -785,6 +869,114 @@ private fun ConversationScreen(
 }
 
 @Composable
+private fun VoiceInputScreen(
+  voice: WatchVoice?,
+  level: Float,
+  onFinish: () -> Unit,
+  onRecordAgain: () -> Unit,
+  onEnter: (String, String) -> Unit,
+) {
+  val recording = voice?.phase == WatchVoicePhase.RECORDING
+  Box(
+    modifier = Modifier
+      .fillMaxSize()
+      .semantics { contentDescription = if (recording) "Voice recording screen. Tap to stop." else "Voice input screen" }
+      .clickable(enabled = recording, role = Role.Button, onClick = onFinish)
+      .padding(20.dp),
+    contentAlignment = Alignment.Center,
+  ) {
+    Column(
+      modifier = Modifier.fillMaxSize(),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+    ) {
+      when (voice?.phase) {
+        WatchVoicePhase.RECORDING -> {
+          Text("Listening", color = PaseoPalette.Foreground, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+          VoiceLevelWaveform(level)
+          Text("Tap anywhere to stop", color = PaseoPalette.ForegroundMuted, fontSize = 12.sp)
+        }
+        WatchVoicePhase.UPLOADING, WatchVoicePhase.TRANSCRIBING -> {
+          CircularProgressIndicator(color = PaseoPalette.AccentBright, modifier = Modifier.size(46.dp))
+          Text(
+            if (voice.phase == WatchVoicePhase.UPLOADING) "Sending audio…" else "Transcribing…",
+            color = PaseoPalette.Foreground,
+            fontSize = 15.sp,
+          )
+        }
+        WatchVoicePhase.CONFIRMATION -> {
+          val transcript = voice.transcript.orEmpty().trim()
+          Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+          ) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .background(PaseoPalette.Surface2, RoundedCornerShape(14.dp))
+                .semantics { contentDescription = "Transcribed text. Scroll to read." }
+                .padding(14.dp),
+            ) {
+              Text(transcript, color = PaseoPalette.Foreground, fontSize = 15.sp)
+            }
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterHorizontally),
+            ) {
+              FooterCircleButton("Retry recording", true, onRecordAgain) { tint -> RetryIcon(tint = tint) }
+              FooterCircleButton("Confirm transcript", transcript.isNotBlank(), {
+                if (transcript.isNotBlank()) onEnter(voice.voiceId, transcript)
+              }) { tint -> CheckIcon(tint = tint) }
+            }
+          }
+        }
+        WatchVoicePhase.ERROR -> {
+          Text(voice.errorMessage ?: voiceErrorLabel(voice.errorCode), color = PaseoPalette.StatusDanger, fontSize = 15.sp)
+          FooterCircleButton("Retry recording", true, onRecordAgain) { tint -> RetryIcon(tint = tint) }
+        }
+        else -> {
+          CircularProgressIndicator(color = PaseoPalette.AccentBright, modifier = Modifier.size(36.dp))
+          Text("Preparing microphone…", color = PaseoPalette.ForegroundMuted, fontSize = 13.sp)
+        }
+      }
+    }
+  }
+}
+
+@Composable
+private fun VoiceLevelWaveform(level: Float) {
+  val samples = remember { mutableStateListOf<Float>() }
+  var targetLevel by remember { mutableFloatStateOf(level) }
+  LaunchedEffect(level) {
+    targetLevel = level
+  }
+  LaunchedEffect(Unit) {
+    while (true) {
+      val previous = samples.lastOrNull() ?: 0f
+      val next = (previous * 0.62f + targetLevel * 0.38f).coerceIn(0f, 1f)
+      if (samples.size == 24) samples.removeAt(0)
+      samples.add(next)
+      delay(65)
+    }
+  }
+  Canvas(modifier = Modifier.fillMaxWidth().height(88.dp).semantics { contentDescription = "Live microphone level" }) {
+    val values = samples.toList().let { captured -> List(24) { index -> captured.getOrElse(index - (24 - captured.size)) { 0f } } }
+    val gap = size.width / 24f
+    values.forEachIndexed { index, value ->
+      val barHeight = (size.height * (0.12f + value.coerceIn(0f, 1f) * 0.88f)).coerceAtMost(size.height)
+      drawLine(
+        color = PaseoPalette.AccentBright,
+        start = Offset(gap * (index + 0.5f), (size.height - barHeight) / 2f),
+        end = Offset(gap * (index + 0.5f), (size.height + barHeight) / 2f),
+        strokeWidth = gap * 0.52f,
+        cap = StrokeCap.Round,
+      )
+    }
+  }
+}
+
+@Composable
 private fun VoiceFooter(
   voice: WatchVoice?,
   viewMode: WatchViewMode,
@@ -794,14 +986,12 @@ private fun VoiceFooter(
   onKeyboard: () -> Unit,
   onSwitch: () -> Unit,
   onOpenPhone: () -> Unit,
-  onCancel: () -> Unit,
   onSendTranscript: (String, String) -> Unit,
 ) {
   var transcript by remember(voice?.voiceId, voice?.transcript) { mutableStateOf(voice?.transcript.orEmpty()) }
   Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
     when (voice?.phase) {
       WatchVoicePhase.CONFIRMATION -> {
-        Text("Review transcript", color = PaseoPalette.ForegroundMuted, fontSize = 11.sp)
         BasicTextField(
           value = transcript,
           onValueChange = { transcript = it },
@@ -813,24 +1003,31 @@ private fun VoiceFooter(
             if (transcript.isNotBlank()) onSendTranscript(voice.voiceId, transcript.trim())
           }),
         )
-        FooterButton("Send", enabled = transcript.isNotBlank()) { onSendTranscript(voice.voiceId, transcript.trim()) }
-        FooterButton("Record again") { onMicrophone() }
-        FooterButton("Cancel") { onCancel() }
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterHorizontally),
+        ) {
+          FooterCircleButton("Retry recording", true, onMicrophone) { tint -> RetryIcon(tint = tint) }
+          FooterCircleButton("Confirm transcript", transcript.isNotBlank(), {
+            if (transcript.isNotBlank()) onSendTranscript(voice.voiceId, transcript.trim())
+          }) { tint -> CheckIcon(tint = tint) }
+        }
+      }
+      WatchVoicePhase.PREVIEW -> {
+        Text("Preparing transcription…", color = PaseoPalette.ForegroundMuted, fontSize = 11.sp)
       }
       WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING, WatchVoicePhase.TRANSCRIBING -> {
         Text(if (voice.phase == WatchVoicePhase.RECORDING) "Recording…" else if (voice.phase == WatchVoicePhase.UPLOADING) "Sending audio…" else "Transcribing…", color = PaseoPalette.AccentBright, fontSize = 12.sp, modifier = Modifier.semantics { contentDescription = "Voice input ${voice.phase.name.lowercase()}" })
         if (voice.phase == WatchVoicePhase.RECORDING) FooterButton("Finish recording") { onFinishVoice() }
-        FooterButton("Cancel") { onCancel() }
       }
       WatchVoicePhase.ERROR -> {
         Text(voice.errorMessage ?: voiceErrorLabel(voice.errorCode), color = PaseoPalette.StatusDanger, fontSize = 12.sp)
         FooterButton("Record again", enabled = phoneAvailable) { onMicrophone() }
-        FooterButton("Cancel") { onCancel() }
       }
       else -> {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
-          FooterCircleButton("Microphone", "●", phoneAvailable, onMicrophone)
-          FooterCircleButton("Keyboard", "⌨", true, onKeyboard)
+          FooterCircleButton("Microphone", phoneAvailable, onMicrophone) { tint -> MicIcon(tint = tint) }
+          FooterCircleButton("Keyboard", true, onKeyboard) { tint -> KeyboardIcon(tint = tint) }
         }
         FooterButton(if (viewMode == WatchViewMode.GLANCE) "Switch to Full" else "Switch to Glance", onClick = onSwitch)
         FooterButton("Open on phone", enabled = phoneAvailable, onClick = onOpenPhone)
@@ -840,9 +1037,113 @@ private fun VoiceFooter(
   }
 }
 
-@Composable private fun FooterCircleButton(label: String, glyph: String, enabled: Boolean, onClick: () -> Unit) {
-  Text(glyph, modifier = Modifier.size(48.dp).background(if (enabled) PaseoPalette.Accent else PaseoPalette.Surface2, CircleShape).semantics { contentDescription = label }.clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(top = 12.dp), color = PaseoPalette.Foreground, fontSize = 18.sp)
+@Composable private fun FooterCircleButton(label: String, enabled: Boolean, onClick: () -> Unit, icon: @Composable (Color) -> Unit) {
+  Box(
+    modifier = Modifier
+      .size(48.dp)
+      .background(if (enabled) PaseoPalette.Accent else PaseoPalette.Surface2, CircleShape)
+      .semantics { contentDescription = label }
+      .clickable(enabled = enabled, role = Role.Button, onClick = onClick),
+    contentAlignment = Alignment.Center,
+  ) {
+    icon(PaseoPalette.Foreground)
+  }
 }
+
+@Composable private fun MicIcon(modifier: Modifier = Modifier, tint: Color) {
+  Canvas(modifier = modifier.size(22.dp)) {
+    val w = size.width
+    val h = size.height
+    val strokeWidth = w * 0.09f
+
+    val capsuleWidth = w * 0.34f
+    val capsuleHeight = h * 0.46f
+    val capsuleLeft = (w - capsuleWidth) / 2f
+    val capsuleTop = h * 0.06f
+    drawRoundRect(
+      color = tint,
+      topLeft = Offset(capsuleLeft, capsuleTop),
+      size = Size(capsuleWidth, capsuleHeight),
+      cornerRadius = CornerRadius(capsuleWidth / 2f, capsuleWidth / 2f),
+    )
+
+    val cradleDiameter = w * 0.62f
+    val cradleTop = capsuleTop + capsuleHeight * 0.5f
+    drawArc(
+      color = tint,
+      startAngle = 0f,
+      sweepAngle = 180f,
+      useCenter = false,
+      topLeft = Offset((w - cradleDiameter) / 2f, cradleTop),
+      size = Size(cradleDiameter, cradleDiameter),
+      style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
+    )
+
+    val standBottom = h * 0.86f
+    drawLine(
+      color = tint,
+      start = Offset(w / 2f, cradleTop + cradleDiameter / 2f),
+      end = Offset(w / 2f, standBottom),
+      strokeWidth = strokeWidth,
+      cap = StrokeCap.Round,
+    )
+    drawLine(
+      color = tint,
+      start = Offset(w * 0.32f, standBottom),
+      end = Offset(w * 0.68f, standBottom),
+      strokeWidth = strokeWidth,
+      cap = StrokeCap.Round,
+    )
+  }
+}
+
+@Composable private fun KeyboardIcon(modifier: Modifier = Modifier, tint: Color) {
+  Canvas(modifier = modifier.size(22.dp)) {
+    val w = size.width
+    val h = size.height
+    val strokeWidth = w * 0.09f
+
+    drawRoundRect(
+      color = tint,
+      topLeft = Offset(w * 0.06f, h * 0.24f),
+      size = Size(w * 0.88f, h * 0.52f),
+      cornerRadius = CornerRadius(w * 0.1f, w * 0.1f),
+      style = Stroke(width = strokeWidth),
+    )
+
+    val keyRadius = w * 0.045f
+    val keyRow = h * 0.4f
+    listOf(0.24f, 0.42f, 0.60f, 0.78f).forEach { fraction ->
+      drawCircle(color = tint, radius = keyRadius, center = Offset(w * fraction, keyRow))
+    }
+    drawLine(
+      color = tint,
+      start = Offset(w * 0.24f, h * 0.62f),
+      end = Offset(w * 0.76f, h * 0.62f),
+      strokeWidth = strokeWidth,
+      cap = StrokeCap.Round,
+    )
+  }
+}
+
+@Composable private fun RetryIcon(modifier: Modifier = Modifier, tint: Color) {
+  Icon(
+    imageVector = Icons.Default.Refresh,
+    contentDescription = null,
+    modifier = modifier.size(22.dp),
+    tint = tint,
+  )
+}
+
+@Composable private fun CheckIcon(modifier: Modifier = Modifier, tint: Color) {
+  Icon(
+    imageVector = Icons.Default.Check,
+    contentDescription = null,
+    modifier = modifier.size(22.dp),
+    tint = tint,
+  )
+}
+
 @Composable private fun FooterButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
   Text(label, modifier = Modifier.fillMaxWidth().background(if (enabled) PaseoPalette.Surface2 else PaseoPalette.Background, RoundedCornerShape(18.dp)).semantics { contentDescription = label }.clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(horizontal = 12.dp, vertical = 10.dp), color = if (enabled) PaseoPalette.Foreground else PaseoPalette.ForegroundMuted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
 }

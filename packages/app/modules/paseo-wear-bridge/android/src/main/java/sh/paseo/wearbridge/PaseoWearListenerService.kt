@@ -11,11 +11,14 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 
 private const val VOICE_EXPIRY_MS = 60_000L
+private const val VOICE_UPLOAD_WAIT_MS = 15_000L
 private const val MAX_VOICE_BYTES = 2_000_000L
 internal const val MAX_VOICE_CHUNK_BYTES = 64 * 1024
 
@@ -26,6 +29,8 @@ data class PendingVoiceTransfer(
   @Volatile var uploadedBytes: Long? = null,
   @Volatile var verifiedBytes: Long? = null,
   val receiving: AtomicBoolean = AtomicBoolean(false),
+  @Volatile var uploadError: String? = null,
+  val uploadComplete: CountDownLatch = CountDownLatch(1),
 )
 
 internal data class VoiceTransferChunk(
@@ -73,11 +78,43 @@ object VoiceTransferRegistry {
   }
 
   fun markUploaded(voiceId: String, byteLength: Long) {
-    pending[voiceId]?.uploadedBytes = byteLength
+    pending[voiceId]?.let { transfer ->
+      transfer.uploadedBytes = byteLength
+      transfer.uploadComplete.countDown()
+    }
+  }
+
+  fun markFailed(voiceId: String, message: String) {
+    pending[voiceId]?.let { transfer ->
+      transfer.uploadError = message
+      transfer.uploadComplete.countDown()
+    }
+  }
+
+  internal fun awaitUploadCompletion(
+    transfer: PendingVoiceTransfer,
+    timeoutMs: Long = VOICE_UPLOAD_WAIT_MS,
+  ): Boolean {
+    val remainingLifetimeMs = transfer.expiresAtMs - System.currentTimeMillis()
+    if (remainingLifetimeMs <= 0) return false
+    return try {
+      transfer.uploadComplete.await(minOf(timeoutMs, remainingLifetimeMs), TimeUnit.MILLISECONDS)
+    } catch (error: InterruptedException) {
+      Thread.currentThread().interrupt()
+      false
+    }
   }
 
   fun finish(voiceId: String, byteLength: Long, sha256: String) {
     val transfer = pending[voiceId] ?: throw IllegalStateException("Unknown voice transfer")
+    if (!awaitUploadCompletion(transfer)) {
+      cancel(voiceId)
+      throw IllegalStateException("Voice transfer did not complete")
+    }
+    transfer.uploadError?.let { message ->
+      cancel(voiceId)
+      throw IllegalStateException("Voice channel failed: $message")
+    }
     if (System.currentTimeMillis() > transfer.expiresAtMs || transfer.uploadedBytes != byteLength || byteLength > MAX_VOICE_BYTES) {
       cancel(voiceId)
       throw IllegalStateException("Voice transfer is incomplete")
@@ -100,7 +137,10 @@ object VoiceTransferRegistry {
   }
 
   fun cancel(voiceId: String) {
-    pending.remove(voiceId)?.file?.delete()
+    pending.remove(voiceId)?.let { transfer ->
+      transfer.uploadComplete.countDown()
+      transfer.file.delete()
+    }
   }
 }
 
@@ -109,8 +149,12 @@ class PaseoWearListenerService : WearableListenerService() {
   override fun onMessageReceived(event: MessageEvent) {
     if (event.path != PaseoWearBridge.REQUEST_PATH) return
     val command = event.data.toString(Charsets.UTF_8)
-    PendingWatchCommandStore.enqueue(this, event.sourceNodeId, command)
     val kind = commandKind(command)
+    Log.i(
+      "PaseoWearBridge",
+      "Watch request received node=${event.sourceNodeId} kind=${kind ?: "unknown"} bytes=${event.data.size}",
+    )
+    PendingWatchCommandStore.enqueue(this, event.sourceNodeId, command)
     if (shouldForeground(kind)) {
       packageManager.getLaunchIntentForPackage(packageName)?.let { launch ->
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -127,6 +171,7 @@ class PaseoWearListenerService : WearableListenerService() {
         }
       }
     }
+    Log.i("PaseoWearBridge", "Watch request queued kind=${kind ?: "unknown"} node=${event.sourceNodeId}")
     val intent = Intent(PaseoWearBridge.COMMAND_ACTION).apply {
       setPackage(packageName)
     }
@@ -136,23 +181,25 @@ class PaseoWearListenerService : WearableListenerService() {
   private fun commandKind(command: String): String? =
     runCatching { JSONObject(command).optString("kind") }.getOrNull()
 
-  private fun shouldForeground(kind: String?): Boolean {
-    return kind == "OPEN_ON_PHONE" ||
-      kind == "START_VOICE_INPUT" ||
-      kind == "STOP_VOICE_INPUT" ||
-      kind == "CANCEL_VOICE_INPUT" ||
-      kind == "SEND_TRANSCRIPT"
-  }
-
   override fun onChannelOpened(channel: ChannelClient.Channel) {
     val voiceId = voiceIdFromChannelPath(channel.path) ?: return
-    val transfer = VoiceTransferRegistry.claim(voiceId, channel.nodeId)
-    if (transfer == null) {
-      Log.w("PaseoWearBridge", "Rejected voice channel voiceId=$voiceId node=${channel.nodeId}")
-      return
-    }
-    Log.i("PaseoWearBridge", "Receiving voice channel voiceId=$voiceId node=${channel.nodeId}")
     voiceExecutor.execute {
+      // START_VOICE_INPUT and ChannelClient.onChannelOpened travel independently. Give
+      // the foreground coordinator a short window to register the transfer before
+      // rejecting a channel that was opened immediately after START.
+      val transfer = (0 until 30).asSequence().mapNotNull {
+        VoiceTransferRegistry.claim(voiceId, channel.nodeId)
+          ?: run {
+            Thread.sleep(50)
+            null
+          }
+      }.firstOrNull()
+      if (transfer == null) {
+        Log.w("PaseoWearBridge", "Rejected voice channel voiceId=$voiceId node=${channel.nodeId}")
+        runCatching { Tasks.await(Wearable.getChannelClient(this).close(channel)) }
+        return@execute
+      }
+      Log.i("PaseoWearBridge", "Receiving voice channel voiceId=$voiceId node=${channel.nodeId}")
       try {
         Tasks.await(Wearable.getChannelClient(this).getInputStream(channel)).use { input ->
           transfer.file.outputStream().use { output ->
@@ -173,11 +220,29 @@ class PaseoWearListenerService : WearableListenerService() {
         }
       } catch (error: Exception) {
         Log.e("PaseoWearBridge", "Voice channel failed voiceId=$voiceId", error)
-        VoiceTransferRegistry.cancel(voiceId)
+        VoiceTransferRegistry.markFailed(voiceId, error.message ?: "Voice channel failed")
       }
     }
   }
 }
+
+private val WATCH_COMMAND_KINDS = setOf(
+  "GET_SNAPSHOT",
+  "GET_PROJECTS",
+  "GET_SESSIONS",
+  "OPEN_SESSION",
+  "LOAD_OLDER_MESSAGES",
+  "CREATE_SESSION",
+  "SEND_PROMPT",
+  "START_VOICE_INPUT",
+  "STOP_VOICE_INPUT",
+  "CANCEL_VOICE_INPUT",
+  "SEND_TRANSCRIPT",
+  "OPEN_ON_PHONE",
+)
+
+/** Every valid command needs the JS coordinator when the phone was cold-started. */
+internal fun shouldForeground(kind: String?): Boolean = kind in WATCH_COMMAND_KINDS
 
 internal fun voiceIdFromChannelPath(path: String): String? {
   if (!path.startsWith(PaseoWearBridge.VOICE_CHANNEL_PREFIX)) return null

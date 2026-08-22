@@ -102,6 +102,7 @@ export interface WatchConversation {
 export type WatchVoicePhase =
   | "ready"
   | "recording"
+  | "preview"
   | "uploading"
   | "transcribing"
   | "confirmation"

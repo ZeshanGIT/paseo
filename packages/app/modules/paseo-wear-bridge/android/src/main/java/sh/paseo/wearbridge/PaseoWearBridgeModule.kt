@@ -6,11 +6,15 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import org.json.JSONObject
+
+private const val WEAR_DEBUG_TAG = "PaseoWearBridge"
 
 object PaseoWearBridge {
   const val CAPABILITY = "paseo_glance_bridge_v1"
@@ -55,7 +59,14 @@ class PaseoWearBridgeModule : Module() {
 
     OnCreate {
       val context = appContext.reactContext ?: return@OnCreate
+      Log.i(WEAR_DEBUG_TAG, "Bridge module created capability=${PaseoWearBridge.CAPABILITY}")
       Wearable.getCapabilityClient(context).addLocalCapability(PaseoWearBridge.CAPABILITY)
+        .addOnSuccessListener {
+          Log.i(WEAR_DEBUG_TAG, "Local capability registered=${PaseoWearBridge.CAPABILITY}")
+        }
+        .addOnFailureListener { error ->
+          Log.e(WEAR_DEBUG_TAG, "Local capability registration failed", error)
+        }
       val commandReceiver = object : BroadcastReceiver() {
         override fun onReceive(receiverContext: Context, intent: Intent) {
           drainPendingCommands(receiverContext)
@@ -68,10 +79,12 @@ class PaseoWearBridgeModule : Module() {
       } else {
         context.registerReceiver(commandReceiver, filter)
       }
+      Log.i(WEAR_DEBUG_TAG, "Command receiver registered")
     }
 
     OnStartObserving {
       WearBridgeRuntimeState.observing = true
+      Log.i(WEAR_DEBUG_TAG, "Bridge observing started")
       appContext.reactContext?.let(::drainPendingCommands)
     }
 
@@ -93,12 +106,18 @@ class PaseoWearBridgeModule : Module() {
 
     AsyncFunction("sendResponse") { nodeId: String, response: String ->
       val context = appContext.reactContext ?: throw IllegalStateException("Paseo Wear Bridge is unavailable")
+      Log.i(WEAR_DEBUG_TAG, "Sending response node=$nodeId bytes=${response.toByteArray().size}")
       Tasks.await(Wearable.getMessageClient(context).sendMessage(nodeId, PaseoWearBridge.RESPONSE_PATH, response.toByteArray()))
       Unit
     }
 
     AsyncFunction("publishSnapshot") { snapshot: String ->
       val context = appContext.reactContext ?: throw IllegalStateException("Paseo Wear Bridge is unavailable")
+      val json = runCatching { JSONObject(snapshot) }.getOrNull()
+      Log.i(
+        WEAR_DEBUG_TAG,
+        "Publishing snapshot generation=${json?.optLong("generation", -1)} connection=${json?.optString("connection")} projects=${json?.optJSONArray("projects")?.length() ?: -1} sessions=${json?.optJSONArray("sessions")?.length() ?: -1} bytes=${snapshot.toByteArray().size}",
+      )
       val request = PutDataMapRequest.create(PaseoWearBridge.SNAPSHOT_PATH)
       request.dataMap.putString("snapshot", snapshot)
       request.dataMap.putLong("updatedAt", System.currentTimeMillis())

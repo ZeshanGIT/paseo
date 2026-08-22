@@ -22,6 +22,7 @@ import {
   type WatchVoiceState,
 } from "./protocol";
 import { createWatchSnapshot } from "./reducer";
+import { selectBestWearSession } from "./session-selection";
 import { WatchCommandDeliveryGuard } from "./command-delivery-guard";
 import {
   createWearDaemonDictationProvider,
@@ -38,10 +39,31 @@ interface WearSessionSource {
 const INITIAL_CONVERSATION_PAGE_SIZE = 8;
 const OLDER_CONVERSATION_PAGE_SIZE = 8;
 
+function describeWearSession(session: SessionState) {
+  return {
+    serverId: session.serverId,
+    connected: Boolean(session.client?.isConnected),
+    projectIds: [...session.projects.keys()],
+    projectLabels: [...session.projects.values()].map(
+      (project) => project.projectCustomName ?? project.projectDisplayName,
+    ),
+    workspaceCount: session.workspaces.size,
+    agentCount: session.agents.size,
+    hasHydratedAgents: session.hasHydratedAgents,
+    hasHydratedWorkspaces: session.hasHydratedWorkspaces,
+    hasWorkspaceDirectorySnapshot: session.hasWorkspaceDirectorySnapshot,
+  };
+}
+
 function findOnlineSession(): WearSessionSource | null {
-  for (const session of Object.values(useSessionStore.getState().sessions)) {
-    if (session.client?.isConnected) return { session, client: session.client };
+  const sessions = Object.values(useSessionStore.getState().sessions);
+  console.warn("[WearDebug] Online session candidates", sessions.map(describeWearSession));
+  const source = selectBestWearSession(sessions);
+  if (source?.client) {
+    console.warn("[WearDebug] Selected session", describeWearSession(source));
+    return { session: source, client: source.client };
   }
+  console.warn("[WearDebug] No connected session", { sessionCount: sessions.length });
   return null;
 }
 
@@ -54,8 +76,13 @@ function getSnapshot(
 ): WatchSnapshot {
   const source = findOnlineSession();
   if (!source) {
+    console.warn("[WearDebug] Snapshot unavailable", { generation });
     return createWatchSnapshot({ generation, phoneAvailable: false, workspaces: [], agents: [] });
   }
+  console.warn("[WearDebug] Snapshot source", {
+    generation,
+    ...describeWearSession(source.session),
+  });
   const latestRepliesByAgentId = new Map(cachedLatestReplies);
   const currentActivityByAgentId = new Map<string, WatchActivity>();
   const turnPresentationByAgentId = new Map<
@@ -91,12 +118,20 @@ function getSnapshot(
   const snapshot = createWatchSnapshot({
     generation,
     phoneAvailable: true,
+    projects: source.session.projects.values(),
     workspaces: source.session.workspaces.values(),
     agents: source.session.agents.values(),
     latestRepliesByAgentId,
     currentActivityByAgentId,
     turnPresentationByAgentId,
     lastTurnDurationByAgentId,
+  });
+  console.warn("[WearDebug] Snapshot built", {
+    generation: snapshot.generation,
+    connection: snapshot.connection,
+    projectIds: snapshot.projects.map((project) => project.projectId),
+    projectLabels: snapshot.projects.map((project) => project.label),
+    sessionCount: snapshot.sessions.length,
   });
   const conversation = toWatchConversation(conversationCache);
   return conversation ? { ...snapshot, conversation } : snapshot;
@@ -163,6 +198,7 @@ export class WearBridgeCoordinator {
 
   start(): void {
     if (this.stopNative) return;
+    console.warn("[WearDebug] Coordinator started");
     this.stopNative = nativeWearBridge.subscribe((event) => void this.handleNativeCommand(event));
     this.stopStore = useSessionStore.subscribe(() => this.schedulePublish());
     void this.publish().catch((error) =>
@@ -521,6 +557,11 @@ export class WearBridgeCoordinator {
   }
 
   private async dispatch(command: WatchCommand, nodeId: string): Promise<WatchResponse> {
+    console.warn("[WearDebug] Command received", {
+      kind: command.kind,
+      id: command.id,
+      nodeId,
+    });
     if (command.kind === "GET_SNAPSHOT") await this.refreshWatchedConversation();
     const snapshot = this.withVoice(
       getSnapshot(
@@ -531,6 +572,12 @@ export class WearBridgeCoordinator {
         this.watchedTurnActive ? this.watchedAgentId : null,
       ),
     );
+    console.warn("[WearDebug] Command response snapshot", {
+      kind: command.kind,
+      id: command.id,
+      projectIds: snapshot.projects.map((project) => project.projectId),
+      sessionCount: snapshot.sessions.length,
+    });
     if (command.kind === "GET_SNAPSHOT" || command.kind === "GET_PROJECTS") {
       return { v: 1, id: command.id, ok: true, snapshot };
     }
@@ -630,6 +677,23 @@ export class WearBridgeCoordinator {
         command.byteLength,
         command.sha256,
       );
+    } catch (error) {
+      console.warn("[WearBridge] Watch audio transfer failed", {
+        voiceId: command.voiceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await this.setVoice({
+        voiceId: command.voiceId,
+        phase: "error",
+        errorCode: "UPLOAD_FAILED",
+        errorMessage: "Audio transfer to phone failed",
+      });
+      await nativeWearBridge.cancelVoiceTransfer(command.voiceId).catch(() => undefined);
+      this.voiceClients.delete(command.voiceId);
+      return this.success(command.id, this.withVoice(getSnapshot(this.generation)));
+    }
+
+    try {
       await this.setVoice({ voiceId: command.voiceId, phase: "transcribing" });
       const transcript = (
         await this.transcriptionProvider.transcribe({ voiceId: command.voiceId })
@@ -644,12 +708,16 @@ export class WearBridgeCoordinator {
               errorMessage: "No speech detected",
             },
       );
-    } catch {
+    } catch (error) {
+      console.warn("[WearBridge] Paseo transcription failed", {
+        voiceId: command.voiceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       await this.setVoice({
         voiceId: command.voiceId,
         phase: "error",
         errorCode: "TRANSCRIPTION_FAILED",
-        errorMessage: "Couldn’t transcribe on this phone",
+        errorMessage: "Couldn’t transcribe through Paseo",
       });
     } finally {
       // V1 never retains raw Watch audio after the one transcription attempt.

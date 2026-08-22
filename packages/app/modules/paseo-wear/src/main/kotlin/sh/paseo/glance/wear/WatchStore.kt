@@ -159,7 +159,7 @@ object WatchStore {
     val state = mutableState.value
     val source = activeVoiceOverride ?: state.snapshot?.voice
     activeVoiceOverride = null
-    if (source?.phase !in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.UPLOADING)) return
+    if (source?.phase !in listOf(WatchVoicePhase.RECORDING, WatchVoicePhase.PREVIEW, WatchVoicePhase.UPLOADING)) return
     val interrupted = interruptedVoice(source!!)
     terminalVoiceOverride = interrupted
     state.snapshot?.let { snapshot ->

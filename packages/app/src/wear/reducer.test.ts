@@ -2,6 +2,25 @@ import { describe, expect, it } from "vitest";
 import { createWatchSnapshot } from "./reducer";
 
 describe("createWatchSnapshot", () => {
+  it("includes active projects that do not have a workspace yet", () => {
+    const snapshot = createWatchSnapshot({
+      generation: 1,
+      phoneAvailable: true,
+      projects: [
+        {
+          projectId: "project-1",
+          projectDisplayName: "Paseo",
+          projectCustomName: "Paseo Glance",
+        },
+      ],
+      workspaces: [],
+      agents: [],
+    });
+
+    expect(snapshot.projects).toEqual([{ projectId: "project-1", label: "Paseo Glance" }]);
+    expect(snapshot.sessions).toEqual([]);
+  });
+
   it("uses authoritative turn liveness even when the directory agent is idle", () => {
     const agent = {
       id: "agent-1",
