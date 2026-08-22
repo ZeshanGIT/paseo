@@ -56,6 +56,29 @@ The existing `redeploy-phone.sh` and `redeploy-watch.sh` wrappers remain
 available for compatibility, but the target-aware script above is the normal
 path for new iterations.
 
+## Exercise a Wear conversation
+
+Use the UI workflow helper to restart the watch app, open a workspace, select a
+chat by index, and send text through the real phone/watch protocol:
+
+```bash
+./scripts/watch-send-text.sh \
+  --serial emulator-5556 \
+  --workspace id360_workspace \
+  --chat-index 0 \
+  --text Hello \
+  --capture-dir .dev/device-captures/wear-send-hello \
+  --verify-back
+```
+
+`--capture-dir` writes a screenshot and accessibility XML for each navigation and
+message step. `--verify-back` uses the app back action, then fails if the chat
+list retains its refresh progress indicator.
+
+The helper auto-selects an attached Wear target when `--serial` is omitted. It
+waits for each accessibility state and verifies that the sent text appears in
+the conversation before exiting.
+
 ## Capture diagnostics
 
 Capture a screenshot and logs into the ignored `paseo/.dev/device-captures/`

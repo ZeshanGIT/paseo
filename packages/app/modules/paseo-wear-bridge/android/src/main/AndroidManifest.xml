@@ -4,18 +4,7 @@
       android:name=".PaseoWearListenerService"
       android:exported="true">
       <intent-filter>
-        <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
-        <data
-          android:scheme="wear"
-          android:host="*"
-          android:path="/paseo-glance/request" />
-      </intent-filter>
-      <intent-filter>
-        <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
-        <data
-          android:scheme="wear"
-          android:host="*"
-          android:pathPrefix="/paseo-glance/voice/v1/" />
+        <action android:name="com.google.android.gms.wearable.BIND_LISTENER" />
       </intent-filter>
     </service>
   </application>
